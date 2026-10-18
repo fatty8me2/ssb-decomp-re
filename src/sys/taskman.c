@@ -293,6 +293,18 @@ void syTaskmanInitGeneralHeap(void *start, u32 size)
 		         start, (unsigned)size);
 		while (TRUE);
 	}
+	{
+		/* SSB64_ARENA_POISON=<byte>: fill the scene arena with garbage
+		 * instead of whatever the previous scene left there. Test-only:
+		 * exposes reads of uninitialized arena memory (netplay desyncs
+		 * between players who visited different menus). */
+		const char *poison = getenv("SSB64_ARENA_POISON");
+
+		if (poison != NULL)
+		{
+			memset(start, atoi(poison) & 0xFF, size);
+		}
+	}
 	syMallocInit(&gSYTaskmanGeneralHeap, 0x10000, start, size);
 #else
 	syMallocInit(&gSYTaskmanGeneralHeap, 0x10000, start, size);

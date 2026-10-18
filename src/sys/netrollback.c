@@ -1182,7 +1182,7 @@ static void syNetRollbackRunNetplayUpdate(void (*update)(void))
  * snapshot ring with the same inputs; each resimulated tick must hash the
  * same as its first run. Any divergence means the snapshot misses state or
  * the tick is not a pure function of snapshot + published input. */
-sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_hash)
+sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_columns)
 {
 	/* Report a tick a little behind our newest confirmed one: the peer
 	 * confirms ticks on its own schedule, and a hash for a tick it hasn't
@@ -1202,15 +1202,27 @@ sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_hash)
 		return FALSE;
 	}
 	*out_tick = tick;
-	*out_hash = sSYNetRollbackConfirmedHashes[ring];
+	{
+		s32 c;
+
+		for (c = 0; c < SYNETSYNC_COLUMN_NUM; c++)
+		{
+#ifdef PORT
+			out_columns[c] = sSYNetRollbackConfirmedColumns[ring].column[c];
+#else
+			out_columns[c] = (c == nSYNetSyncColumnFull) ? sSYNetRollbackConfirmedHashes[ring] : 0;
+#endif
+		}
+	}
 
 	return TRUE;
 }
 
 /* The peer's full-state hash for a tick it has confirmed. Ours must match;
  * a mismatch means the simulations diverged (a determinism bug). */
-void syNetRollbackCheckRemoteConfirmedHash(u32 tick, u32 hash)
+void syNetRollbackCheckRemoteConfirmedHash(u32 tick, const u32 *columns)
 {
+	u32 hash = columns[nSYNetSyncColumnFull];
 	s32 ring = tick % SYNETROLLBACK_CONFIRMED_RING;
 
 	if ((sSYNetRollbackConfirmedValid[ring] == FALSE) || (sSYNetRollbackConfirmedTicks[ring] != tick))
@@ -1232,8 +1244,9 @@ void syNetRollbackCheckRemoteConfirmedHash(u32 tick, u32 hash)
 
 			for (c = 0; c < SYNETSYNC_COLUMN_NUM; c++)
 			{
-				port_log("SSB64 Rollback: DESYNC tick=%u column %s=%08X\n", tick, syNetSyncGetColumnName(c),
-				         cols->column[c]);
+				port_log("SSB64 Rollback: DESYNC tick=%u column %-8s local=%08X remote=%08X%s\n", tick,
+				         syNetSyncGetColumnName(c), cols->column[c], columns[c],
+				         (cols->column[c] != columns[c]) ? "  <-- DIFFERS" : "");
 			}
 		}
 #endif

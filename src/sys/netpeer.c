@@ -16,6 +16,7 @@ extern void port_log(const char *fmt, ...);
 #endif
 
 #ifdef PORT
+#include <stdlib.h>
 #include <string.h>
 #include <net/port_udp.h>
 #endif
@@ -25,7 +26,7 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_MAX_PACKET_FRAMES 16
 #define SYNETPEER_FRAME_BYTES 8
 #define SYNETPEER_INPUT_HEADER_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1)
-#define SYNETPEER_SYNC_CHECK_BYTES (4 + 4)
+#define SYNETPEER_SYNC_CHECK_BYTES (4 + (4 * SYNETSYNC_COLUMN_NUM))
 #define SYNETPEER_PACKET_BYTES ((SYNETPEER_INPUT_HEADER_BYTES) + ((SYNETPEER_MAX_PACKET_FRAMES) * (SYNETPEER_FRAME_BYTES)) + SYNETPEER_SYNC_CHECK_BYTES + 4)
 #define SYNETPEER_VALIDATION_INPUT_WINDOW 120
 #define SYNETPEER_METADATA_BYTES (11 * 4 + 8 + (MAXCONTROLLERS * 7))
@@ -114,6 +115,9 @@ sb32 sSYNetPeerBattleBarrierReleased;
 u32 sSYNetPeerBattleBarrierWaitFrames;
 u32 sSYNetPeerBattleStartRepeatFrames;
 u32 sSYNetPeerExecutionHoldFrames;
+sb32 sSYNetPeerIsHoldRandSaved;
+s32 sSYNetPeerHoldRandSeed;
+sb32 sSYNetPeerIsTestHold;
 sb32 sSYNetPeerExecutionBeginLogged;
 
 sb32 sSYNetPeerIsRollback;           // SSB64_NETPLAY_ROLLBACK (default on)
@@ -685,6 +689,7 @@ void syNetPeerInitDebugEnv(void)
 	sSYNetPeerBattleBarrierWaitFrames = 0;
 	sSYNetPeerBattleStartRepeatFrames = 0;
 	sSYNetPeerExecutionHoldFrames = 0;
+	sSYNetPeerIsHoldRandSaved = FALSE;
 	sSYNetPeerExecutionBeginLogged = FALSE;
 
 	if ((netplay_env == NULL) || (atoi(netplay_env) == 0))
@@ -814,6 +819,7 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerBattleBarrierWaitFrames = 0;
 	sSYNetPeerBattleStartRepeatFrames = 0;
 	sSYNetPeerExecutionHoldFrames = 0;
+	sSYNetPeerIsHoldRandSaved = FALSE;
 	sSYNetPeerExecutionBeginLogged = (sSYNetPeerBattleBarrierEnabled == FALSE) ? TRUE : FALSE;
 
 	{
@@ -921,7 +927,7 @@ sb32 syNetPeerCheckBattleExecutionReady(void)
 	{
 		return TRUE;
 	}
-	return sSYNetPeerFrameReady;
+	return ((sSYNetPeerFrameReady != FALSE) && (sSYNetPeerIsTestHold == FALSE)) ? TRUE : FALSE;
 }
 
 sb32 syNetPeerIsRollbackActive(void)
@@ -1007,15 +1013,20 @@ void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 	}
 	{
 		u32 check_tick;
-		u32 check_hash;
+		u32 check_columns[SYNETSYNC_COLUMN_NUM];
+		s32 c;
 
-		if (syNetRollbackGetLatestConfirmedHash(&check_tick, &check_hash) == FALSE)
+		if (syNetRollbackGetLatestConfirmedHash(&check_tick, check_columns) == FALSE)
 		{
 			check_tick = 0xFFFFFFFFU;
-			check_hash = 0;
+			memset(check_columns, 0, sizeof(check_columns));
 		}
 		syNetPeerWriteU32(&cursor, check_tick);
-		syNetPeerWriteU32(&cursor, check_hash);
+
+		for (c = 0; c < SYNETSYNC_COLUMN_NUM; c++)
+		{
+			syNetPeerWriteU32(&cursor, check_columns[c]);
+		}
 	}
 	syNetPeerWriteU32(&cursor, checksum);
 	*out_size = SYNETPEER_PACKET_BYTES;
@@ -1058,7 +1069,8 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 	u8 packet_remote_player;
 	s32 remote_advantage;
 	u32 check_tick;
-	u32 check_hash;
+	u32 check_columns[SYNETSYNC_COLUMN_NUM];
+	s32 check_c;
 	u32 current_tick = syNetInputGetTick();
 	s32 i;
 
@@ -1104,7 +1116,11 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 		frames[i].stick_y = (s8)syNetPeerReadU8(&cursor);
 	}
 	check_tick = syNetPeerReadU32(&cursor);
-	check_hash = syNetPeerReadU32(&cursor);
+
+	for (check_c = 0; check_c < SYNETSYNC_COLUMN_NUM; check_c++)
+	{
+		check_columns[check_c] = syNetPeerReadU32(&cursor);
+	}
 	checksum = syNetPeerReadU32(&cursor);
 	expected_checksum = syNetPeerChecksumPacket(session_id, ack_tick, packet_seq, player, frame_count, frames);
 
@@ -1118,7 +1134,7 @@ void syNetPeerHandlePacket(const u8 *buffer, s32 size)
 
 	if (check_tick != 0xFFFFFFFFU)
 	{
-		syNetRollbackCheckRemoteConfirmedHash(check_tick, check_hash);
+		syNetRollbackCheckRemoteConfirmedHash(check_tick, check_columns);
 	}
 
 	if (sSYNetPeerRecvSeqInitialized == FALSE)
@@ -1404,8 +1420,37 @@ void syNetPeerUpdateBattleGate(void)
 	syNetPeerReceiveRemoteInput();
 	syNetPeerUpdateStartBarrier();
 
+#ifdef PORT
+	{
+		/* SSB64_NETPLAY_EXTRA_HOLD=<frames>: test-only, hold this peer that
+		 * many extra frames at the start, like a slower PC would. */
+		static s32 extra_hold = -1;
+
+		if (sSYNetPeerExecutionHoldFrames == 0)
+		{
+			const char *env = getenv("SSB64_NETPLAY_EXTRA_HOLD");
+
+			extra_hold = (env != NULL) ? atoi(env) : 0;
+		}
+		sSYNetPeerIsTestHold = FALSE;
+		if ((extra_hold > 0) && (sSYNetPeerFrameReady != FALSE))
+		{
+			extra_hold--;
+			sSYNetPeerIsTestHold = TRUE;
+		}
+	}
+#endif
 	if (syNetPeerCheckBattleExecutionReady() == FALSE)
 	{
+		/* A held frame runs no tick but still draws, and some draw code
+		 * calls the game RNG. Hold lengths differ between the two PCs (the
+		 * start barrier, pacing stalls), so keep the RNG as it was when the
+		 * hold began and restore it before the next tick. */
+		if (sSYNetPeerIsHoldRandSaved == FALSE)
+		{
+			sSYNetPeerHoldRandSeed = syUtilsRandSeed();
+			sSYNetPeerIsHoldRandSaved = TRUE;
+		}
 		sSYNetPeerExecutionHoldFrames++;
 		syNetPeerLogExecutionHold();
 
@@ -1416,7 +1461,15 @@ void syNetPeerUpdateBattleGate(void)
 			syNetPeerSendLocalInput();
 		}
 	}
-	else syNetPeerLogExecutionBegin();
+	else
+	{
+		if ((sSYNetPeerIsHoldRandSaved != FALSE) && (getenv("SSB64_NETPLAY_NO_RAND_RESTORE") == NULL))
+		{
+			syUtilsSetRandomSeed(sSYNetPeerHoldRandSeed);
+			sSYNetPeerIsHoldRandSaved = FALSE;
+		}
+		syNetPeerLogExecutionBegin();
+	}
 }
 
 void syNetPeerUpdate(void)

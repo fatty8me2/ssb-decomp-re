@@ -40,8 +40,10 @@ extern void syNetRollbackLoad(s32 slot);
 extern sb32 syNetRollbackResimulate(u32 first_tick, u32 last_tick, void (*update)(void), SYNetSyncTickHash *hashes);
 extern void syNetRollbackRunBattleUpdate(void (*update)(void));
 extern s32 syNetRollbackTakeDrawRequest(void);
-extern sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_hash);
-extern void syNetRollbackCheckRemoteConfirmedHash(u32 tick, u32 hash);
+/* Sync check: every hash column (SYNETSYNC_COLUMN_NUM u32s, full first) of
+ * a confirmed tick, so a mismatch names the part of the state that differs. */
+extern sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_columns);
+extern void syNetRollbackCheckRemoteConfirmedHash(u32 tick, const u32 *columns);
 extern sb32 syNetRollbackIsDesynced(void);
 extern void syTaskmanShadowDraw(void);
 
