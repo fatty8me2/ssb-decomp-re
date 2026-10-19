@@ -722,8 +722,11 @@ void scVSBattleStartScene(void)
 		extern int port_enhancement_skip_results_screen(void);
 		if (port_enhancement_skip_results_screen())
 		{
+			extern int port_netlobby_after_match(void);
+
 			// Override the next scene to immediately boot back to Character Select!
-			gSCManagerSceneData.scene_curr = nSCKindPlayersVS;
+			// (After an online match: the VS menu, where the Online window offers a rematch.)
+			gSCManagerSceneData.scene_curr = (port_netlobby_after_match() != 0) ? nSCKindVSMode : nSCKindPlayersVS;
 		}
 	}
 }

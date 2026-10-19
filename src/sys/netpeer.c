@@ -847,6 +847,16 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerTimeSyncStallFrames = 0;
 	sSYNetPeerFramesSinceTimeSync = 0;
 
+	if ((sSYNetPeerBootstrapMetadataApplied != FALSE) && (getenv("SSB64_NETPLAY_NO_RESEED") == NULL))
+	{
+		/* The seed was set when the match was requested, but each player's
+		 * menu kept running (and drawing random numbers) until the battle
+		 * scene loaded - a different amount on each PC. Re-seed here, before
+		 * the scene's own setup (itManagerInitItems, stage setup) uses it. */
+		syUtilsSetRandomSeedPtr(NULL);
+		syUtilsSetRandomSeed(sSYNetPeerBootstrapMetadata.rng_seed);
+	}
+
 	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote=%d delay=%u barrier=%d rollback=%d fuzz=%u tick=%u\n",
 	         (sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
 	         sSYNetPeerLocalPlayer, sSYNetPeerRemotePlayer, sSYNetPeerInputDelay,
@@ -1519,6 +1529,17 @@ void syNetPeerStartOnline(s32 local_player, s32 remote_player, u32 delay, sb32 i
 
 	syNetRollbackSetTickTimer(TRUE);
 	syNetPeerApplyBootstrapMetadata(metadata);
+	{
+		/* SSB64_NETPLAY_PRE_RAND=<n>: test-only, burn n RNG calls before the
+		 * battle scene loads, like a menu that animates on one player's PC. */
+		const char *pre_rand = getenv("SSB64_NETPLAY_PRE_RAND");
+		s32 n = (pre_rand != NULL) ? atoi(pre_rand) : 0;
+
+		while (n-- > 0)
+		{
+			syUtilsRandUShort();
+		}
+	}
 	portSCManagerRequestScene(nSCKindVSBattle);
 
 	port_log("SSB64 NetPeer: online match local=%d remote=%d delay=%u host=%d stage=%u seed=%u\n",

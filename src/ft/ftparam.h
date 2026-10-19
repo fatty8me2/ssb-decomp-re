@@ -102,6 +102,9 @@ extern void ftParamsUpdateFighterPartsTransform(DObj *arg0);
 extern void ftParamSetAnimLocks(FTStruct *fp);
 extern void ftParamClearAnimLocks(FTStruct *fp);
 extern void func_ovl2_800EB924(CObj *cobj, Mtx44f mtx, Vec3f *vec, f32 *rx, f32 *ry);
+#ifdef PORT
+extern void ftParamProjectWorldToScreenGameplay(CObj *cobj, Mtx44f mtx, Vec3f *vec, f32 *rx, f32 *ry);
+#endif
 extern f32 func_ovl2_800EBA6C(Vec3f *arg0, Vec3f *arg1);
 extern f32 func_ovl2_800EBB3C(Vec3f *arg0, Vec3f *arg1, Vec3f *arg2);
 #ifdef PORT

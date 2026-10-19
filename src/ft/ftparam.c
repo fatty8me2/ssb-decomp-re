@@ -2621,6 +2621,22 @@ void ftParamClearAnimLocks(FTStruct *fp)
 extern float port_widescreen_clip_x_scale(void);
 #endif
 
+#ifdef PORT
+static sb32 sFTParamIsProjectGameplay;
+
+/* Gameplay callers (Link's boomerang off-screen check) must project exactly
+ * like the N64 in online matches: the widescreen fixup below depends on each
+ * player's window, so it would make the two simulations disagree. */
+void ftParamProjectWorldToScreenGameplay(CObj *cobj, Mtx44f mtx, Vec3f *vec, f32 *rx, f32 *ry)
+{
+    extern sb32 syNetPeerIsRollbackActive(void);
+
+    sFTParamIsProjectGameplay = syNetPeerIsRollbackActive();
+    func_ovl2_800EB924(cobj, mtx, vec, rx, ry);
+    sFTParamIsProjectGameplay = FALSE;
+}
+#endif
+
 // 0x800EB924
 void func_ovl2_800EB924(CObj *cobj, Mtx44f mtx, Vec3f *vec, f32 *rx, f32 *ry)
 {
@@ -2653,7 +2669,10 @@ void func_ovl2_800EB924(CObj *cobj, Mtx44f mtx, Vec3f *vec, f32 *rx, f32 *ry)
     // characters. Apply the same compression here so projected x lands at
     // the same clip-space NDC as the 3D vertex path. No-op (1.0f) when
     // widescreen is off.
-    *rx *= port_widescreen_clip_x_scale();
+    if (sFTParamIsProjectGameplay == FALSE)
+    {
+        *rx *= port_widescreen_clip_x_scale();
+    }
 #endif
 }
 

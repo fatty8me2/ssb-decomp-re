@@ -27,6 +27,8 @@ extern char *getenv(const char *name); /* decomp include/stdlib.h shadows the ho
 
 #ifdef PORT
 #include "port_log.h"
+static s32 *syTaskmanBeginDrawRand(void);
+static void syTaskmanEndDrawRand(s32 *saved);
 /* The token-pointer table (port/resource/RelocPointerTable) and Fast3D's
  * uintptr_t Gfx words make the port pointer-width-agnostic, so both LP64/LLP64
  * (8-byte) and ILP32 (4-byte, e.g. Android armeabi-v7a) builds are supported.
@@ -1153,9 +1155,13 @@ void syTaskmanRunTask(SYTaskFunction *tfunc)
 			}
 			if ((dSYTaskmanUpdateCount % sSYTaskmanFrameInterval == 0) && (syTaskmanSwitchContext(1) != FALSE))
 			{
+				s32 *rand_saved;
+
 				sSYTaskmanTimeStart = osGetCount();
 
+				rand_saved = syTaskmanBeginDrawRand();
 				tfunc->task_draw(tfunc);
+				syTaskmanEndDrawRand(rand_saved);
 
 				dSYTaskmanFrameCount++;
 				sSYTaskmanFrameTimeDelta = (osGetCount() - sSYTaskmanTimeStart) / 2971;
@@ -1206,6 +1212,31 @@ void syTaskmanRunTask(SYTaskFunction *tfunc)
 }
 
 #ifdef PORT
+/* Online matches: the draw pass runs on a private RNG seed, reset to the same
+ * value before every draw. Visual settings (HUD, hitbox view, widescreen) can
+ * change what a draw does; with the game RNG they would change how far it
+ * advances and the two players' matches would diverge. */
+extern s32 *sSYUtilsRandomSeedPtr;
+extern sb32 syNetPeerIsRollbackActive(void);
+static s32 sSYTaskmanDrawRandSeed;
+
+static s32 *syTaskmanBeginDrawRand(void)
+{
+	s32 *saved = sSYUtilsRandomSeedPtr;
+
+	if (syNetPeerIsRollbackActive() != FALSE)
+	{
+		sSYTaskmanDrawRandSeed = 0x5EED5EED;
+		sSYUtilsRandomSeedPtr = &sSYTaskmanDrawRandSeed;
+	}
+	return saved;
+}
+
+static void syTaskmanEndDrawRand(s32 *saved)
+{
+	sSYUtilsRandomSeedPtr = saved;
+}
+
 /* Rollback: the draw pass has gameplay side effects that the next tick reads
  * (camera matrix for Link's boomerang, magnifying-glass state, ...). Ticks
  * resimulated by rollback are never drawn, so syNetRollbackResimulate runs
@@ -1260,7 +1291,12 @@ void syTaskmanShadowDraw(void)
 	gSYTaskmanGraphicsHeap.ptr = sSYTaskmanShadowHeap;
 
 	portInterpSetRecordSuppressed(1);
-	sSYTaskmanDefaultFunction.scene_draw();
+	{
+		s32 *rand_saved = syTaskmanBeginDrawRand();
+
+		sSYTaskmanDefaultFunction.scene_draw();
+		syTaskmanEndDrawRand(rand_saved);
+	}
 	portInterpSetRecordSuppressed(0);
 
 	for (i = 0; i < ARRAY_COUNT(gSYTaskmanDLHeads); i++)
