@@ -2,6 +2,7 @@
 
 #include <ft/fighter.h>
 #include <gr/ground.h>
+#include <it/item.h>
 #include <sc/scmanager.h>
 #include <sys/netinput.h>
 #include <sys/netreplay.h>
@@ -855,6 +856,14 @@ void syNetPeerStartVSSession(void)
 		 * the scene's own setup (itManagerInitItems, stage setup) uses it. */
 		syUtilsSetRandomSeedPtr(NULL);
 		syUtilsSetRandomSeed(sSYNetPeerBootstrapMetadata.rng_seed);
+
+		/* Item-manager globals that itManagerInitItems only fills in when
+		 * items are on (or rebuilds lazily, like the Poke Ball list): left
+		 * as the previous match on this PC set them, so two players' values
+		 * differ. Start every online match from the fresh-boot state. */
+		memset(&gITManagerRandomWeights, 0, sizeof(gITManagerRandomWeights));
+		memset(&gITManagerMonsterData, 0, sizeof(gITManagerMonsterData));
+		memset(&gITManagerAppearActor, 0, sizeof(gITManagerAppearActor));
 	}
 
 	port_log("SSB64 NetPeer: VS session start role=%s local=%d remote=%d delay=%u barrier=%d rollback=%d fuzz=%u tick=%u\n",
