@@ -43,7 +43,7 @@ extern s32 syNetRollbackTakeDrawRequest(void);
 /* Sync check: every hash column (SYNETSYNC_COLUMN_NUM u32s, full first) of
  * a confirmed tick, so a mismatch names the part of the state that differs. */
 extern sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_columns);
-extern void syNetRollbackCheckRemoteConfirmedHash(u32 tick, const u32 *columns);
+extern void syNetRollbackCheckRemoteConfirmedHash(s32 player, u32 tick, const u32 *columns);
 extern sb32 syNetRollbackIsDesynced(void);
 extern void syTaskmanShadowDraw(void);
 

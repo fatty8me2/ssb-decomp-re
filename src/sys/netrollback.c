@@ -1031,7 +1031,7 @@ static void syNetRollbackStoreLiveHash(u32 tick)
  * every remote input up to it confirmed. */
 static void syNetRollbackEmitConfirmedTrace(u32 last_simulated_tick)
 {
-	u32 confirmed = syNetInputGetRemoteNextUnconfirmed(syNetPeerGetRemotePlayer());
+	u32 confirmed = syNetPeerGetConfirmedTick();
 
 #ifdef PORT
 	if ((sSYNetRollbackConfirmedTrace == NULL) && (sSYNetRollbackConfirmedTracePath == NULL) &&
@@ -1171,7 +1171,7 @@ static void syNetRollbackRunNetplayUpdate(void (*update)(void))
 	{
 		port_log("SSB64 Rollback: netplay tick=%u rollbacks=%u resim_ticks=%u max_rollback=%u failed=%u confirmed=%u sync_checks=%u desync=%d\n",
 		         tick, sSYNetRollbackRollbacks, sSYNetRollbackResimTicks, sSYNetRollbackMaxRollback,
-		         sSYNetRollbackFailedRollbacks, syNetInputGetRemoteNextUnconfirmed(syNetPeerGetRemotePlayer()),
+		         sSYNetRollbackFailedRollbacks, syNetPeerGetConfirmedTick(),
 		         sSYNetRollbackSyncChecks, sSYNetRollbackIsDesynced);
 	}
 #endif
@@ -1220,7 +1220,7 @@ sb32 syNetRollbackGetLatestConfirmedHash(u32 *out_tick, u32 *out_columns)
 
 /* The peer's full-state hash for a tick it has confirmed. Ours must match;
  * a mismatch means the simulations diverged (a determinism bug). */
-void syNetRollbackCheckRemoteConfirmedHash(u32 tick, const u32 *columns)
+void syNetRollbackCheckRemoteConfirmedHash(s32 player, u32 tick, const u32 *columns)
 {
 	u32 hash = columns[nSYNetSyncColumnFull];
 	s32 ring = tick % SYNETROLLBACK_CONFIRMED_RING;
@@ -1236,8 +1236,8 @@ void syNetRollbackCheckRemoteConfirmedHash(u32 tick, const u32 *columns)
 		sSYNetRollbackIsDesynced = TRUE;
 		sSYNetRollbackDesyncTick = tick;
 #ifdef PORT
-		port_log("SSB64 Rollback: DESYNC detected at tick=%u local=%08X remote=%08X\n",
-		         tick, sSYNetRollbackConfirmedHashes[ring], hash);
+		port_log("SSB64 Rollback: DESYNC detected at tick=%u local=%08X remote=%08X (player %d)\n",
+		         tick, sSYNetRollbackConfirmedHashes[ring], hash, player);
 		{
 			const SYNetSyncTickHash *cols = &sSYNetRollbackConfirmedColumns[ring];
 			s32 c;
