@@ -42,6 +42,7 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_BOOTSTRAP_RETRY_USECS 16666
 #define SYNETPEER_BARRIER_LOG_INTERVAL 30
 #define SYNETPEER_BATTLE_START_REPEAT_FRAMES 60
+#define SYNETPEER_STANDIN_GIVEUP_FRAMES 900     // a stand-in barrier master (host migration) waits this long for a player's READY
 
 /* Barrier chatter: READY goes out every 4th frame and the host's START every
  * other frame (every frame would cost the relay 60 messages a second per
@@ -2553,13 +2554,55 @@ static s32 syNetPeerCountBattleStart(void)
 	return count;
 }
 
-static sb32 syNetPeerCheckHostBattleStart(void)
+/* The match host (game slot 0) left the room before the start barrier was released. */
+static sb32 syNetPeerIsHostGone(void)
 {
 	s32 i;
 
 	for (i = 0; i < sSYNetPeerRemoteCount; i++)
 	{
-		if ((sSYNetPeerRemotes[i].is_host != FALSE) && (sSYNetPeerRemotes[i].battle_start != FALSE))
+		if ((sSYNetPeerRemotes[i].is_host != FALSE) && (sSYNetPeerRemotes[i].left_hint != FALSE))
+		{
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+/* Who runs the barrier: the match host. If it left before the barrier was released (host migration:
+ * it will never send START), the lowest player still in the room takes over, so the others do not wait
+ * forever. Every survivor computes the same answer from the lobby's leave notices. */
+static sb32 syNetPeerIsBarrierMaster(void)
+{
+	s32 i;
+
+	if (sSYNetPeerBootstrapIsHost != FALSE)
+	{
+		return TRUE;
+	}
+	if (syNetPeerIsHostGone() == FALSE)
+	{
+		return FALSE;
+	}
+	for (i = 0; i < sSYNetPeerRemoteCount; i++)
+	{
+		if ((sSYNetPeerRemotes[i].left_hint == FALSE) && (sSYNetPeerRemotes[i].player < sSYNetPeerLocalPlayer))
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+static sb32 syNetPeerCheckHostBattleStart(void)
+{
+	sb32 host_gone = syNetPeerIsHostGone();
+	s32 i;
+
+	for (i = 0; i < sSYNetPeerRemoteCount; i++)
+	{
+		/* A START from anyone proves the barrier was released by the host (or its stand-in). */
+		if (((sSYNetPeerRemotes[i].is_host != FALSE) || (host_gone != FALSE)) && (sSYNetPeerRemotes[i].battle_start != FALSE))
 		{
 			return TRUE;
 		}
@@ -2619,8 +2662,25 @@ void syNetPeerUpdateStartBarrier(void)
 	{
 		syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_READY);
 	}
-	if (sSYNetPeerBootstrapIsHost != FALSE)
+	if (syNetPeerIsBarrierMaster() != FALSE)
 	{
+		if ((sSYNetPeerBootstrapIsHost == FALSE) && (sSYNetPeerBattleBarrierWaitFrames > SYNETPEER_STANDIN_GIVEUP_FRAMES))
+		{
+			/* We stand in for a host that left before the barrier: a player that never reached the battle
+			 * (it missed the host's BEGIN and waits in the lobby) must not hold everybody else here forever. */
+			s32 i;
+
+			for (i = 0; i < sSYNetPeerRemoteCount; i++)
+			{
+				SYNetPeerRemote *remote = &sSYNetPeerRemotes[i];
+
+				if ((remote->battle_ready == FALSE) && (remote->left_hint == FALSE))
+				{
+					remote->left_hint = TRUE;
+					port_log("SSB64 NetPeer: player %d never reached the battle, starting without it\n", remote->player);
+				}
+			}
+		}
 		if (syNetPeerCountBattleReady() == sSYNetPeerRemoteCount)
 		{
 			if (((sSYNetPeerBattleBarrierWaitFrames & 1) == 0) || (sSYNetPeerBattleStartSent == FALSE))
