@@ -24,10 +24,10 @@ extern void port_log(const char *fmt, ...);
 #endif
 
 #define SYNETPEER_MAGIC 0x53534E50 // SSNP
-#define SYNETPEER_VERSION 4
+#define SYNETPEER_VERSION 5
 #define SYNETPEER_MAX_PACKET_FRAMES 16
 #define SYNETPEER_FRAME_BYTES 8
-#define SYNETPEER_INPUT_HEADER_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 1 + 1 + 1 + 1)
+#define SYNETPEER_INPUT_HEADER_BYTES (4 + 2 + 2 + 4 + 4 + 1 + 1 + (2 * MAXCONTROLLERS))
 #define SYNETPEER_SYNC_CHECK_BYTES (4 + (4 * SYNETSYNC_COLUMN_NUM))
 #define SYNETPEER_PACKET_BYTES ((SYNETPEER_INPUT_HEADER_BYTES) + ((SYNETPEER_MAX_PACKET_FRAMES) * (SYNETPEER_FRAME_BYTES)) + SYNETPEER_SYNC_CHECK_BYTES + 4)
 #define SYNETPEER_VALIDATION_INPUT_WINDOW 120
@@ -41,7 +41,12 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_BOOTSTRAP_RETRY_COUNT 300
 #define SYNETPEER_BOOTSTRAP_RETRY_USECS 16666
 #define SYNETPEER_BARRIER_LOG_INTERVAL 30
-#define SYNETPEER_BATTLE_START_REPEAT_FRAMES 30
+#define SYNETPEER_BATTLE_START_REPEAT_FRAMES 60
+
+/* Barrier chatter: READY goes out every 4th frame and the host's START every
+ * other frame (every frame would cost the relay 60 messages a second per
+ * player for nothing). Replies to a waiting peer are immediate. */
+#define SYNETPEER_BARRIER_READY_INTERVAL 4
 
 /* Every other player in the match is a remote: a full mesh, each remote
  * sends us its own input directly (or through the lobby relay). */
@@ -88,13 +93,11 @@ typedef struct SYNetPeerRemote
 	s32 transport;              // port_udp peer index (its lobby slot)
 	sb32 is_host;               // the match host (game slot 0)
 	u32 highest_tick;           // newest input tick received from it
-	u32 send_seq;               // UDP send sequence of our packets to it
 	u32 recv_seq_high_water;
 	sb32 recv_seq_initialized;
 	u32 seq_gaps;
 	u32 seq_duplicates;
 	u32 seq_out_of_order;
-	u32 last_ack_tick;
 	u32 last_packet_oldest_tick;
 	u32 last_packet_newest_tick;
 	sb32 last_packet_ticks_valid;
@@ -120,6 +123,8 @@ u32 sSYNetPeerFramesStaged;
 u32 sSYNetPeerLateFrames;
 u32 sSYNetPeerInputChecksum;
 u32 sSYNetPeerLastLogTick;
+u32 sSYNetPeerSendSeq;               // one sequence for the broadcast input packets
+u32 sSYNetPeerSendPhase;             // advances once per frame; relayed peers hear us every other frame
 sb32 sSYNetPeerBootstrapIsEnabled;
 sb32 sSYNetPeerBootstrapIsHost;
 sb32 sSYNetPeerBootstrapMetadataApplied;
@@ -130,6 +135,7 @@ SYNetInputReplayMetadata sSYNetPeerBootstrapMetadata;
 sb32 sSYNetPeerBattleBarrierEnabled;
 sb32 sSYNetPeerBattleLocalReady;
 sb32 sSYNetPeerBattleStartSent;
+sb32 sSYNetPeerBattleStartReplyNeeded;   // a peer still in the barrier asked (READY) after we were released
 sb32 sSYNetPeerBattleBarrierReleased;
 u32 sSYNetPeerBattleBarrierWaitFrames;
 u32 sSYNetPeerBattleStartRepeatFrames;
@@ -171,7 +177,7 @@ u32 syNetPeerChecksumAccumulateFrame(u32 checksum, const SYNetPeerPacketFrame *f
 	return checksum;
 }
 
-u32 syNetPeerChecksumPacket(u32 session_id, u32 ack_tick, u32 packet_seq, u8 player, u8 frame_count, const SYNetPeerPacketFrame *frames)
+u32 syNetPeerChecksumPacket(u32 session_id, u32 packet_seq, u8 player, u8 frame_count, const s16 *leads, const SYNetPeerPacketFrame *frames)
 {
 	u32 checksum = 2166136261U;
 	s32 i;
@@ -180,11 +186,14 @@ u32 syNetPeerChecksumPacket(u32 session_id, u32 ack_tick, u32 packet_seq, u8 pla
 	checksum = syNetPeerChecksumAccumulateU32(checksum, SYNETPEER_VERSION);
 	checksum = syNetPeerChecksumAccumulateU32(checksum, SYNETPEER_PACKET_INPUT);
 	checksum = syNetPeerChecksumAccumulateU32(checksum, session_id);
-	checksum = syNetPeerChecksumAccumulateU32(checksum, ack_tick);
 	checksum = syNetPeerChecksumAccumulateU32(checksum, packet_seq);
 	checksum = syNetPeerChecksumAccumulateU32(checksum, player);
 	checksum = syNetPeerChecksumAccumulateU32(checksum, frame_count);
 
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		checksum = syNetPeerChecksumAccumulateU32(checksum, (u16)leads[i]);
+	}
 	for (i = 0; i < frame_count; i++)
 	{
 		checksum = syNetPeerChecksumAccumulateFrame(checksum, &frames[i]);
@@ -339,13 +348,11 @@ sb32 syNetPeerCheckMetadata(const SYNetInputReplayMetadata *metadata)
 static void syNetPeerResetRemoteStats(SYNetPeerRemote *remote)
 {
 	remote->highest_tick = 0;
-	remote->send_seq = 0;
 	remote->recv_seq_high_water = 0;
 	remote->recv_seq_initialized = FALSE;
 	remote->seq_gaps = 0;
 	remote->seq_duplicates = 0;
 	remote->seq_out_of_order = 0;
-	remote->last_ack_tick = 0;
 	remote->last_packet_oldest_tick = 0;
 	remote->last_packet_newest_tick = 0;
 	remote->last_packet_ticks_valid = FALSE;
@@ -496,20 +503,34 @@ void syNetPeerApplyBootstrapMetadata(const SYNetInputReplayMetadata *metadata)
 }
 
 #ifdef PORT
-/* Send to one remote / to every remote. */
-void syNetPeerSendBytesTo(const SYNetPeerRemote *remote, const u8 *buffer, u32 size)
+/* Sends one datagram to every remote. With `is_input` set, remotes that are
+ * only reachable through the lobby server's relay get it every other frame:
+ * the relay's cost is per message, and the redundant input bundle makes up
+ * for the skipped frame. (Control packets always go out: a skipped one could
+ * be systematically skipped, since the replies arrive on a fixed parity.) The
+ * relayed copies share one relay frame. */
+sb32 syNetPeerSendBytes(const u8 *buffer, u32 size, sb32 is_input)
 {
-	port_udp_peer_send(remote->transport, buffer, (s32)size);
-}
-
-void syNetPeerSendBytes(const u8 *buffer, u32 size)
-{
+	s32 peers[SYNETPEER_MAX_REMOTES];
+	s32 count = 0;
 	s32 i;
 
 	for (i = 0; i < sSYNetPeerRemoteCount; i++)
 	{
-		syNetPeerSendBytesTo(&sSYNetPeerRemotes[i], buffer, size);
+		s32 transport = sSYNetPeerRemotes[i].transport;
+
+		if ((is_input != FALSE) && (sSYNetPeerIsSocketExternal != FALSE) && (port_udp_peer_is_relay(transport) != FALSE) &&
+		    ((sSYNetPeerSendPhase & 1) != 0))
+		{
+			continue;
+		}
+		peers[count++] = transport;
 	}
+	if (count == 0)
+	{
+		return FALSE;
+	}
+	return (port_udp_peers_send(peers, count, buffer, (s32)size) == (s32)size) ? TRUE : FALSE;
 }
 #endif
 
@@ -526,7 +547,7 @@ void syNetPeerSendControlPacket(u16 packet_type)
 	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
 	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
 	syNetPeerWriteU32(&cursor, checksum);
-	syNetPeerSendBytes(buffer, SYNETPEER_CONTROL_PACKET_BYTES);
+	syNetPeerSendBytes(buffer, SYNETPEER_CONTROL_PACKET_BYTES, FALSE);
 #endif
 }
 
@@ -544,7 +565,7 @@ void syNetPeerSendMatchConfigPacket(void)
 	syNetPeerWriteMetadata(&cursor, &sSYNetPeerBootstrapMetadata);
 	checksum = syNetPeerChecksumBytes(buffer, cursor - buffer);
 	syNetPeerWriteU32(&cursor, checksum);
-	syNetPeerSendBytes(buffer, SYNETPEER_BOOTSTRAP_PACKET_BYTES);
+	syNetPeerSendBytes(buffer, SYNETPEER_BOOTSTRAP_PACKET_BYTES, FALSE);
 }
 
 void syNetPeerHandleControlPacket(SYNetPeerRemote *remote, const u8 *buffer, s32 size)
@@ -592,6 +613,13 @@ void syNetPeerHandleControlPacket(SYNetPeerRemote *remote, const u8 *buffer, s32
 			         syNetInputGetTick(), sSYNetPeerLocalPlayer);
 		}
 		remote->battle_ready = TRUE;
+
+		/* It is still waiting at the barrier although we were released (our
+		 * START or its answer was lost): say it again. */
+		if ((sSYNetPeerBattleBarrierEnabled != FALSE) && (sSYNetPeerBattleBarrierReleased != FALSE))
+		{
+			sSYNetPeerBattleStartReplyNeeded = TRUE;
+		}
 	}
 	else if (packet_type == SYNETPEER_PACKET_BATTLE_START)
 	{
@@ -799,6 +827,7 @@ void syNetPeerInitDebugEnv(void)
 	sSYNetPeerBattleBarrierEnabled = FALSE;
 	sSYNetPeerBattleLocalReady = FALSE;
 	sSYNetPeerBattleStartSent = FALSE;
+	sSYNetPeerBattleStartReplyNeeded = FALSE;
 	sSYNetPeerBattleBarrierReleased = TRUE;
 	sSYNetPeerBattleBarrierWaitFrames = 0;
 	sSYNetPeerBattleStartRepeatFrames = 0;
@@ -915,10 +944,13 @@ void syNetPeerStartVSSession(void)
 	sSYNetPeerLateFrames = 0;
 	sSYNetPeerInputChecksum = 2166136261U;
 	sSYNetPeerLastLogTick = 0;
+	sSYNetPeerSendSeq = 0;
+	sSYNetPeerSendPhase = 0;
 	sSYNetPeerIsActive = TRUE;
 	sSYNetPeerBattleBarrierEnabled = sSYNetPeerBootstrapIsEnabled;
 	sSYNetPeerBattleLocalReady = sSYNetPeerBattleBarrierEnabled;
 	sSYNetPeerBattleStartSent = FALSE;
+	sSYNetPeerBattleStartReplyNeeded = FALSE;
 	sSYNetPeerBattleBarrierReleased = (sSYNetPeerBattleBarrierEnabled == FALSE) ? TRUE : FALSE;
 	sSYNetPeerBattleBarrierWaitFrames = 0;
 	sSYNetPeerBattleStartRepeatFrames = 0;
@@ -1055,6 +1087,7 @@ void syNetPeerBeginFrame(void)
 		sSYNetPeerFrameReady = TRUE;
 		return;
 	}
+	sSYNetPeerSendPhase++;
 	syNetPeerReceiveRemoteInput();
 	syNetPeerUpdateStartBarrier();
 	sSYNetPeerFramesSinceTimeSync++;
@@ -1081,14 +1114,16 @@ sb32 syNetPeerCheckStartBarrierReleased(void)
 	return syNetPeerCheckBattleExecutionReady();
 }
 
-/* The packet for one remote: our recent local inputs (every remote gets the
- * same frames) plus per-remote ack/advantage, and the newest confirmed-state
- * hash for the desync check. */
-void syNetPeerBuildPacket(const SYNetPeerRemote *remote, u8 *buffer, u32 *out_size)
+/* The input packet: our recent local inputs, how far we run ahead of each
+ * remote's confirmed input (their time sync), and the newest confirmed-state
+ * hash for the desync check. Identical for every remote, so it can be
+ * broadcast (and relayed as one frame). */
+void syNetPeerBuildPacket(u8 *buffer, u32 *out_size)
 {
 	SYNetInputFrame history_frame;
 	SYNetPeerPacketFrame frames[SYNETPEER_MAX_PACKET_FRAMES];
 	SYNetPeerPacketFrame zero_frame;
+	s16 leads[MAXCONTROLLERS];
 	u8 *cursor = buffer;
 	u32 latest_tick;
 	u32 checksum;
@@ -1098,6 +1133,7 @@ void syNetPeerBuildPacket(const SYNetPeerRemote *remote, u8 *buffer, u32 *out_si
 
 	memset(frames, 0, sizeof(frames));
 	memset(&zero_frame, 0, sizeof(zero_frame));
+	memset(leads, 0, sizeof(leads));
 
 	/* The newest sample was scheduled for (tick being published) + delay; the
 	 * packet repeats the last 16 scheduled frames for loss tolerance. */
@@ -1115,32 +1151,35 @@ void syNetPeerBuildPacket(const SYNetPeerRemote *remote, u8 *buffer, u32 *out_si
 			frame_count++;
 		}
 	}
+	for (i = 0; i < sSYNetPeerRemoteCount; i++)
+	{
+		s32 advantage = (s32)syNetInputGetTick() - (s32)syNetInputGetRemoteNextUnconfirmed(sSYNetPeerRemotes[i].player);
+
+		advantage = (advantage < -32768) ? -32768 : (advantage > 32767) ? 32767 : advantage;
+		leads[sSYNetPeerRemotes[i].player] = (s16)advantage;
+	}
 	checksum = syNetPeerChecksumPacket
 	(
 		sSYNetPeerSessionID,
-		remote->highest_tick,
-		remote->send_seq,
+		sSYNetPeerSendSeq,
 		(u8)sSYNetPeerLocalPlayer,
 		(u8)frame_count,
+		leads,
 		frames
 	);
 
 	syNetPeerWriteU32(&cursor, SYNETPEER_MAGIC);
 	syNetPeerWriteU16(&cursor, SYNETPEER_VERSION);
-	{
-		s32 advantage = (s32)syNetInputGetTick() - (s32)syNetInputGetRemoteNextUnconfirmed(remote->player);
-
-		advantage = (advantage < -32768) ? -32768 : (advantage > 32767) ? 32767 : advantage;
-		syNetPeerWriteU16(&cursor, (u16)(s16)advantage);
-	}
+	syNetPeerWriteU16(&cursor, 0);
 	syNetPeerWriteU32(&cursor, sSYNetPeerSessionID);
-	syNetPeerWriteU32(&cursor, remote->highest_tick);
-	syNetPeerWriteU32(&cursor, remote->send_seq);
+	syNetPeerWriteU32(&cursor, sSYNetPeerSendSeq);
 	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerLocalPlayer);
 	syNetPeerWriteU8(&cursor, (u8)frame_count);
-	syNetPeerWriteU8(&cursor, (u8)sSYNetPeerLocalPlayer);
-	syNetPeerWriteU8(&cursor, (u8)remote->player);
 
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		syNetPeerWriteU16(&cursor, (u16)leads[i]);
+	}
 	for (i = 0; i < SYNETPEER_MAX_PACKET_FRAMES; i++)
 	{
 		SYNetPeerPacketFrame *frame = (i < frame_count) ? &frames[i] : &zero_frame;
@@ -1175,24 +1214,18 @@ void syNetPeerSendLocalInput(void)
 {
 #ifdef PORT
 	u8 buffer[SYNETPEER_PACKET_BYTES];
-	s32 i;
+	u32 size;
 
-	for (i = 0; i < sSYNetPeerRemoteCount; i++)
+	syNetPeerBuildPacket(buffer, &size);
+
+	if (size == 0)
 	{
-		SYNetPeerRemote *remote = &sSYNetPeerRemotes[i];
-		u32 size;
-
-		syNetPeerBuildPacket(remote, buffer, &size);
-
-		if (size == 0)
-		{
-			continue;
-		}
-		if (port_udp_peer_send(remote->transport, buffer, (s32)size) == (s32)size)
-		{
-			sSYNetPeerPacketsSent++;
-			remote->send_seq++;
-		}
+		return;
+	}
+	if (syNetPeerSendBytes(buffer, size, TRUE) != FALSE)
+	{
+		sSYNetPeerPacketsSent++;
+		sSYNetPeerSendSeq++;
 	}
 #endif
 }
@@ -1203,16 +1236,13 @@ void syNetPeerHandlePacket(SYNetPeerRemote *remote, const u8 *buffer, s32 size)
 	SYNetPeerPacketFrame frames[SYNETPEER_MAX_PACKET_FRAMES];
 	u32 magic;
 	u32 session_id;
-	u32 ack_tick;
 	u32 packet_seq;
 	u32 checksum;
 	u32 expected_checksum;
 	u16 version;
 	u8 player;
 	u8 frame_count;
-	u8 packet_local_player;
-	u8 packet_remote_player;
-	s32 remote_advantage;
+	s16 leads[MAXCONTROLLERS];
 	u32 check_tick;
 	u32 check_columns[SYNETSYNC_COLUMN_NUM];
 	s32 check_c;
@@ -1235,23 +1265,22 @@ void syNetPeerHandlePacket(SYNetPeerRemote *remote, const u8 *buffer, s32 size)
 
 	magic = syNetPeerReadU32(&cursor);
 	version = syNetPeerReadU16(&cursor);
-	remote_advantage = (s16)syNetPeerReadU16(&cursor);
+	syNetPeerReadU16(&cursor);
 	session_id = syNetPeerReadU32(&cursor);
-	ack_tick = syNetPeerReadU32(&cursor);
 	packet_seq = syNetPeerReadU32(&cursor);
 	player = syNetPeerReadU8(&cursor);
 	frame_count = syNetPeerReadU8(&cursor);
-	packet_local_player = syNetPeerReadU8(&cursor);
-	packet_remote_player = syNetPeerReadU8(&cursor);
 
 	if ((magic != SYNETPEER_MAGIC) || (version != SYNETPEER_VERSION) ||
 		(session_id != sSYNetPeerSessionID) || (player != (u8)remote->player) ||
-		(packet_local_player != (u8)remote->player) ||
-		(packet_remote_player != (u8)sSYNetPeerLocalPlayer) ||
 		(frame_count > SYNETPEER_MAX_PACKET_FRAMES))
 	{
 		sSYNetPeerPacketsDropped++;
 		return;
+	}
+	for (i = 0; i < MAXCONTROLLERS; i++)
+	{
+		leads[i] = (s16)syNetPeerReadU16(&cursor);
 	}
 	for (i = 0; i < SYNETPEER_MAX_PACKET_FRAMES; i++)
 	{
@@ -1267,7 +1296,7 @@ void syNetPeerHandlePacket(SYNetPeerRemote *remote, const u8 *buffer, s32 size)
 		check_columns[check_c] = syNetPeerReadU32(&cursor);
 	}
 	checksum = syNetPeerReadU32(&cursor);
-	expected_checksum = syNetPeerChecksumPacket(session_id, ack_tick, packet_seq, player, frame_count, frames);
+	expected_checksum = syNetPeerChecksumPacket(session_id, packet_seq, player, frame_count, leads, frames);
 
 	if (checksum != expected_checksum)
 	{
@@ -1276,7 +1305,7 @@ void syNetPeerHandlePacket(SYNetPeerRemote *remote, const u8 *buffer, s32 size)
 	}
 	sSYNetPeerPacketsReceived++;
 	remote->packets_received++;
-	remote->advantage = remote_advantage;
+	remote->advantage = leads[sSYNetPeerLocalPlayer];     // how far it runs ahead of our input
 
 	if (check_tick != 0xFFFFFFFFU)
 	{
@@ -1304,8 +1333,6 @@ void syNetPeerHandlePacket(SYNetPeerRemote *remote, const u8 *buffer, s32 size)
 			remote->seq_out_of_order++;
 		}
 	}
-	remote->last_ack_tick = ack_tick;
-
 	if (frame_count > 0)
 	{
 		u32 oldest_tick_bundle = frames[0].tick;
@@ -1498,7 +1525,7 @@ void syNetPeerLogNetSyncValidation(u32 tick)
 	fighter_hash = syNetSyncHashBattleFighters();
 
 	port_log(
-		"SSB64 NetSync: role=%s lp=%d remotes=%d tick=%u hist_win=[%u,%u) all=0x%08X p0=0x%08X p1=0x%08X p2=0x%08X p3=0x%08X figh=0x%08X snd_next=%u rcv_hw=%u gap=%u dup=%u ooo=%u puck=%u pko=%u pkn=%u sent=%u recv=%u dropped=%u stg=%u hr=%u late=%u inpchk=0x%08X pkt_valid=%d\n",
+		"SSB64 NetSync: role=%s lp=%d remotes=%d tick=%u hist_win=[%u,%u) all=0x%08X p0=0x%08X p1=0x%08X p2=0x%08X p3=0x%08X figh=0x%08X snd_next=%u rcv_hw=%u gap=%u dup=%u ooo=%u pko=%u pkn=%u sent=%u recv=%u dropped=%u stg=%u hr=%u late=%u inpchk=0x%08X pkt_valid=%d\n",
 		(sSYNetPeerBootstrapIsHost != FALSE) ? "host" : "client",
 		sSYNetPeerLocalPlayer,
 		sSYNetPeerRemoteCount,
@@ -1511,12 +1538,11 @@ void syNetPeerLogNetSyncValidation(u32 tick)
 		checksums[2],
 		checksums[3],
 		fighter_hash,
-		(first != NULL) ? first->send_seq : 0,
+		sSYNetPeerSendSeq,
 		(first != NULL) ? first->recv_seq_high_water : 0,
 		syNetPeerSumSeqGaps(),
 		syNetPeerSumSeqDuplicates(),
 		syNetPeerSumSeqOutOfOrder(),
-		(first != NULL) ? first->last_ack_tick : 0,
 		((first != NULL) && (first->last_packet_ticks_valid != FALSE)) ? first->last_packet_oldest_tick : (~(u32)0),
 		((first != NULL) && (first->last_packet_ticks_valid != FALSE)) ? first->last_packet_newest_tick : (~(u32)0),
 		sSYNetPeerPacketsSent,
@@ -1676,13 +1702,19 @@ void syNetPeerUpdateStartBarrier(void)
 		return;
 	}
 	sSYNetPeerBattleBarrierWaitFrames++;
-	syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_READY);
 
+	if ((sSYNetPeerBattleBarrierWaitFrames % SYNETPEER_BARRIER_READY_INTERVAL) == 1)
+	{
+		syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_READY);
+	}
 	if (sSYNetPeerBootstrapIsHost != FALSE)
 	{
 		if (syNetPeerCountBattleReady() == sSYNetPeerRemoteCount)
 		{
-			syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_START);
+			if (((sSYNetPeerBattleBarrierWaitFrames & 1) == 0) || (sSYNetPeerBattleStartSent == FALSE))
+			{
+				syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_START);
+			}
 			sSYNetPeerBattleStartSent = TRUE;
 
 			if (syNetPeerCountBattleStart() == sSYNetPeerRemoteCount)
@@ -1711,6 +1743,24 @@ void syNetPeerUpdateBattleGate(void)
 	}
 	syNetPeerReceiveRemoteInput();
 	syNetPeerUpdateStartBarrier();
+
+	/* After the barrier: keep confirming our START for a while, and answer any
+	 * peer that is still waiting. This runs even while pacing holds the tick
+	 * (a released peer waiting for input must still release the others). */
+	if ((sSYNetPeerBattleBarrierEnabled != FALSE) && (sSYNetPeerBattleBarrierReleased != FALSE) &&
+	    ((sSYNetPeerBattleStartRepeatFrames != 0) || (sSYNetPeerBattleStartReplyNeeded != FALSE)))
+	{
+		if ((sSYNetPeerBattleStartReplyNeeded != FALSE) || ((sSYNetPeerBattleStartRepeatFrames & 1) == 0))
+		{
+			syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_START);
+		}
+		sSYNetPeerBattleStartReplyNeeded = FALSE;
+
+		if (sSYNetPeerBattleStartRepeatFrames != 0)
+		{
+			sSYNetPeerBattleStartRepeatFrames--;
+		}
+	}
 
 #ifdef PORT
 	{
@@ -1775,11 +1825,6 @@ void syNetPeerUpdate(void)
 	if (syNetPeerCheckBattleExecutionReady() == FALSE)
 	{
 		return;
-	}
-	if (sSYNetPeerBattleStartRepeatFrames != 0)
-	{
-		syNetPeerSendControlPacket(SYNETPEER_PACKET_BATTLE_START);
-		sSYNetPeerBattleStartRepeatFrames--;
 	}
 	syNetPeerSendLocalInput();
 	syNetPeerLogStats();
