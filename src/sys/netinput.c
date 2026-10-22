@@ -411,6 +411,21 @@ void syNetInputResolveFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 	}
 }
 
+/* Taps/releases for a tick are derived against the stored frame of tick-1 (cleared at tick 0),
+ * never against whatever was published last. A tick that is held for several frames (start
+ * barrier, stall) is published once per frame; without this the second publish would see its own
+ * buttons as "previous" and lose the tap/release, and peers that stall differently would diverge. */
+static void syNetInputSeedLastPublished(s32 player, u32 tick)
+{
+	SYNetInputFrame prev;
+
+	if ((tick == 0) || (syNetInputGetStoredFrame(sSYNetInputHistory, player, tick - 1, &prev) == FALSE))
+	{
+		syNetInputClearFrame(&prev);
+	}
+	sSYNetInputSlots[player].last_published = prev;
+}
+
 void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame)
 {
 	SYNetInputFrame *last_published = &sSYNetInputSlots[player].last_published;
@@ -437,7 +452,6 @@ void syNetInputPublishFrame(s32 player, SYNetInputFrame *frame)
 void syNetInputRepublishTick(u32 tick)
 {
 	SYNetInputFrame frame;
-	SYNetInputFrame prev;
 	s32 player;
 
 	for (player = 0; player < MAXCONTROLLERS; player++)
@@ -451,11 +465,7 @@ void syNetInputRepublishTick(u32 tick)
 		}
 		else syNetInputResolveFrame(player, tick, &frame);
 
-		if ((tick == 0) || (syNetInputGetStoredFrame(sSYNetInputHistory, player, tick - 1, &prev) == FALSE))
-		{
-			syNetInputClearFrame(&prev);
-		}
-		sSYNetInputSlots[player].last_published = prev;
+		syNetInputSeedLastPublished(player, tick);
 		syNetInputPublishFrame(player, &frame);
 	}
 	syNetInputPublishMainController();
@@ -724,6 +734,7 @@ void syNetInputFuncRead(void)
 	for (player = 0; player < MAXCONTROLLERS; player++)
 	{
 		syNetInputResolveFrame(player, tick, &frame);
+		syNetInputSeedLastPublished(player, tick);
 		syNetInputPublishFrame(player, &frame);
 
 		if (sSYNetInputIsRecording != FALSE)

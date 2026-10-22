@@ -115,7 +115,7 @@ void syNetReplayApplyBattleMetadata(const SYNetInputReplayMetadata *metadata)
 
 	*battle_state = dSCManagerDefaultBattleState;
 	battle_state->game_type = metadata->game_type;
-	battle_state->gkind = metadata->stage_kind;
+	battle_state->gkind = ((metadata->stage_kind >= nGRKindBattleStart) && (metadata->stage_kind <= nGRKindBattleEnd)) ? metadata->stage_kind : nGRKindCastle;
 	battle_state->is_team_battle = metadata->is_team_battle;
 	battle_state->game_rules = metadata->game_rules;
 	battle_state->time_limit = metadata->time_limit;
@@ -145,11 +145,33 @@ void syNetReplayApplyBattleMetadata(const SYNetInputReplayMetadata *metadata)
 			handicap = 9;
 		}
 
-		battle_state->players[player].player = (metadata->is_team_battle != FALSE) ? metadata->teams[player] : player;
-		battle_state->players[player].team = metadata->teams[player];
+		u8 team = metadata->teams[player];
+		u8 fkind = metadata->fighter_kinds[player];
+		u8 costume = metadata->costumes[player];
+
+		/* Same untrusted-input rule for the rest of the per-player fields (netplay metadata
+		 * arrives over the wire too): team indexes dIFCommonPlayerTeamColorIDs[] (4 teams),
+		 * fkind indexes the fighter tables, costume the costume tables. */
+		if (team >= 4)
+		{
+			team = 0;
+		}
+		if ((metadata->player_kinds[player] == nFTPlayerKindMan) || (metadata->player_kinds[player] == nFTPlayerKindCom))
+		{
+			if (fkind > nFTKindPlayableEnd)
+			{
+				fkind = nFTKindMario;
+			}
+		}
+		if (costume > 3)
+		{
+			costume = 0;
+		}
+		battle_state->players[player].player = (metadata->is_team_battle != FALSE) ? team : player;
+		battle_state->players[player].team = team;
 		battle_state->players[player].pkind = metadata->player_kinds[player];
-		battle_state->players[player].fkind = metadata->fighter_kinds[player];
-		battle_state->players[player].costume = metadata->costumes[player];
+		battle_state->players[player].fkind = fkind;
+		battle_state->players[player].costume = costume;
 		battle_state->players[player].shade = metadata->shades[player];
 		battle_state->players[player].handicap = handicap;
 		battle_state->players[player].level = metadata->levels[player];
@@ -159,17 +181,17 @@ void syNetReplayApplyBattleMetadata(const SYNetInputReplayMetadata *metadata)
 		if (metadata->player_kinds[player] == nFTPlayerKindMan)
 		{
 			battle_state->players[player].color =
-			(metadata->is_team_battle == FALSE) ? player : dIFCommonPlayerTeamColorIDs[metadata->teams[player]];
+			(metadata->is_team_battle == FALSE) ? player : dIFCommonPlayerTeamColorIDs[team];
 			battle_state->pl_count++;
 		}
 		else if (metadata->player_kinds[player] == nFTPlayerKindCom)
 		{
 			battle_state->players[player].color =
-			(metadata->is_team_battle == FALSE) ? GMCOMMON_PLAYERS_MAX : dIFCommonPlayerTeamColorIDs[metadata->teams[player]];
+			(metadata->is_team_battle == FALSE) ? GMCOMMON_PLAYERS_MAX : dIFCommonPlayerTeamColorIDs[team];
 			battle_state->cp_count++;
 		}
 	}
-	gSCManagerSceneData.gkind = metadata->stage_kind;
+	gSCManagerSceneData.gkind = battle_state->gkind;
 }
 
 void syNetReplayInitDebugEnv(void)

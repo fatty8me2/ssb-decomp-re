@@ -1430,6 +1430,7 @@ void syNetPeerReceiveRemoteInput(void)
 {
 #ifdef PORT
 	u8 buffer[SYNETPEER_PACKET_BYTES];
+	s32 bad_reads = 0;
 
 	while (TRUE)
 	{
@@ -1437,12 +1438,21 @@ void syNetPeerReceiveRemoteInput(void)
 		s32 size = port_udp_recv_peer(buffer, sizeof(buffer), &transport);
 		SYNetPeerRemote *remote;
 
-		if (size <= 0)
+		if (size < 0)
 		{
-			if (size < 0)
+			/* An oversize or errored datagram is consumed by the socket layer: drop it and keep
+			 * draining so one stray packet can't starve this frame's real ones. Bounded so a
+			 * persistent socket error can't spin forever. */
+			sSYNetPeerPacketsDropped++;
+
+			if (++bad_reads >= 64)
 			{
-				sSYNetPeerPacketsDropped++;
+				break;
 			}
+			continue;
+		}
+		if (size == 0)
+		{
 			break;
 		}
 		remote = syNetPeerFindRemoteByTransport(transport);
