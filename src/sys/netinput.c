@@ -42,6 +42,10 @@ u32 sSYNetInputLocalDelay;
 SYNetInputFrame sSYNetInputLocalSchedule[MAXCONTROLLERS][SYNETINPUT_HISTORY_LENGTH];
 /* Every remote tick below this has a confirmed input (per player). */
 u32 sSYNetInputRemoteNextUnconfirmed[MAXCONTROLLERS];
+/* A player dropped from the match (netpeer.c agrees the tick with the survivors):
+ * from this tick on its input is neutral and always confirmed. SYNETINPUT_NO_DROP = none. */
+#define SYNETINPUT_NO_DROP 0xFFFFFFFFU
+u32 sSYNetInputDropTick[MAXCONTROLLERS];
 /* Earliest already-published tick whose confirmed remote input differs from
  * the prediction that was simulated; consumed by the rollback driver. */
 u32 sSYNetInputMispredictTick;
@@ -175,6 +179,7 @@ void syNetInputReset(void)
 			syNetInputClearFrame(&sSYNetInputLocalSchedule[player][i]);
 		}
 		sSYNetInputRemoteNextUnconfirmed[player] = 0;
+		sSYNetInputDropTick[player] = SYNETINPUT_NO_DROP;
 		sSYNetInputLocalDevice[player] = player;
 		for (i = 0; i < SYNETINPUT_REPLAY_MAX_FRAMES; i++)
 		{
@@ -213,6 +218,10 @@ void syNetInputSetRemoteInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 
 	if (syNetInputCheckPlayer(player) == FALSE)
 	{
 		return;
+	}
+	if (tick >= sSYNetInputDropTick[player])
+	{
+		return;     // the player is gone from this tick on: its neutral input is fixed
 	}
 	if (syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, NULL) != FALSE)
 	{
@@ -257,7 +266,47 @@ void syNetInputPreconfirmRemote(s32 player, u32 tick_count)
 
 u32 syNetInputGetRemoteNextUnconfirmed(s32 player)
 {
-	return (syNetInputCheckPlayer(player) != FALSE) ? sSYNetInputRemoteNextUnconfirmed[player] : 0;
+	if (syNetInputCheckPlayer(player) == FALSE)
+	{
+		return 0;
+	}
+	/* Every input below the drop tick is in: nothing is left to wait for. */
+	if (sSYNetInputRemoteNextUnconfirmed[player] >= sSYNetInputDropTick[player])
+	{
+		return 0xFFFFFFFFU;
+	}
+	return sSYNetInputRemoteNextUnconfirmed[player];
+}
+
+/* From `tick` on, `player` plays neutral input (it dropped out). Ticks that were
+ * already simulated at or after it used a guess or a late real input: flag a
+ * rollback to the drop tick so they are replayed with the neutral input. */
+void syNetInputSetDropTick(s32 player, u32 tick)
+{
+	if ((syNetInputCheckPlayer(player) == FALSE) || (sSYNetInputDropTick[player] != SYNETINPUT_NO_DROP))
+	{
+		return;
+	}
+	sSYNetInputDropTick[player] = tick;
+
+	if (tick < sSYNetInputTick)
+	{
+		if ((sSYNetInputIsMispredicted == FALSE) || (tick < sSYNetInputMispredictTick))
+		{
+			sSYNetInputMispredictTick = tick;
+			sSYNetInputIsMispredicted = TRUE;
+		}
+	}
+}
+
+u32 syNetInputGetDropTick(s32 player)
+{
+	return (syNetInputCheckPlayer(player) != FALSE) ? sSYNetInputDropTick[player] : SYNETINPUT_NO_DROP;
+}
+
+sb32 syNetInputGetRemoteConfirmedFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
+{
+	return syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, out_frame);
 }
 
 sb32 syNetInputTakeMispredictTick(u32 *out_tick)
@@ -385,7 +434,11 @@ void syNetInputResolveFrame(s32 player, u32 tick, SYNetInputFrame *out_frame)
 	{
 	case nSYNetInputSourceRemoteConfirmed:
 	case nSYNetInputSourceRemotePredicted:
-		if (syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, out_frame) != FALSE)
+		if (tick >= sSYNetInputDropTick[player])
+		{
+			syNetInputMakeFrame(out_frame, tick, 0, 0, 0, nSYNetInputSourceRemoteConfirmed, FALSE);
+		}
+		else if (syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, out_frame) != FALSE)
 		{
 			sSYNetInputSlots[player].last_confirmed = *out_frame;
 		}

@@ -953,6 +953,16 @@ static sb32 syNetRollbackCompareTick(u32 tick, const SYNetSyncTickHash *expected
 	return (diff_mask & SYNETSYNC_GATED_COLUMN_MASK) ? TRUE : FALSE;
 }
 
+/* One simulated tick, first run or resimulated. Players who dropped out of the
+ * match are knocked out at their agreed tick (netpeer.c): here, after the
+ * snapshot of the tick was taken, so a rollback to or before it replays the
+ * knock-out on every peer alike. */
+static void syNetRollbackRunTick(void (*update)(void), u32 tick)
+{
+	syNetPeerApplyDrops(tick);
+	update();
+}
+
 /* Saves the pre-update state of sim tick `tick` into its ring slot. */
 static sb32 syNetRollbackSaveTick(u32 tick)
 {
@@ -998,7 +1008,7 @@ sb32 syNetRollbackResimulate(u32 first_tick, u32 last_tick, void (*update)(void)
 			syNetRollbackSaveTick(tick);
 		}
 		syNetInputRepublishTick(tick);
-		update();
+		syNetRollbackRunTick(update, tick);
 
 		/* Stand in for the draw that followed this tick originally: draw
 		 * passes produce state the next tick's gameplay reads. The last tick
@@ -1154,7 +1164,7 @@ static void syNetRollbackRunNetplayUpdate(void (*update)(void))
 		}
 	}
 #endif
-	update();
+	syNetRollbackRunTick(update, tick);
 	syNetRollbackStoreLiveHash(tick);
 #ifdef PORT
 	/* Readable state at a few early ticks: both players' logs can be diffed
