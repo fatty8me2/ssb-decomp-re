@@ -25,6 +25,7 @@ enum SYNetRollbackDraw
 
 extern void syNetRollbackInitDebugEnv(void);
 extern void syNetRollbackStartVSSession(void);
+extern void syNetRollbackContinueTraceAt(u32 tick);
 extern void syNetRollbackFinishVSSession(void);
 
 extern void syNetRollbackNoteFileLoad(void *dst, size_t size, sb32 is_figatree);

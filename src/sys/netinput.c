@@ -46,6 +46,9 @@ u32 sSYNetInputRemoteNextUnconfirmed[MAXCONTROLLERS];
  * from this tick on its input is neutral and always confirmed. SYNETINPUT_NO_DROP = none. */
 #define SYNETINPUT_NO_DROP 0xFFFFFFFFU
 u32 sSYNetInputDropTick[MAXCONTROLLERS];
+/* A player is suspected gone but the drop tick is not agreed yet: its input at or beyond this tick is not
+ * taken, so what we hold of it (and how far we may simulate past it) stops growing. */
+u32 sSYNetInputFreezeTick[MAXCONTROLLERS];
 /* Earliest already-published tick whose confirmed remote input differs from
  * the prediction that was simulated; consumed by the rollback driver. */
 u32 sSYNetInputMispredictTick;
@@ -180,6 +183,7 @@ void syNetInputReset(void)
 		}
 		sSYNetInputRemoteNextUnconfirmed[player] = 0;
 		sSYNetInputDropTick[player] = SYNETINPUT_NO_DROP;
+		sSYNetInputFreezeTick[player] = SYNETINPUT_NO_DROP;
 		sSYNetInputLocalDevice[player] = player;
 		for (i = 0; i < SYNETINPUT_REPLAY_MAX_FRAMES; i++)
 		{
@@ -219,9 +223,9 @@ void syNetInputSetRemoteInput(s32 player, u32 tick, u16 buttons, s8 stick_x, s8 
 	{
 		return;
 	}
-	if (tick >= sSYNetInputDropTick[player])
+	if ((tick >= sSYNetInputDropTick[player]) || (tick >= sSYNetInputFreezeTick[player]))
 	{
-		return;     // the player is gone from this tick on: its neutral input is fixed
+		return;     // the player is gone from this tick on (or about to be): its input there is not taken
 	}
 	if (syNetInputGetStoredFrame(sSYNetInputRemoteHistory, player, tick, NULL) != FALSE)
 	{
@@ -296,6 +300,14 @@ void syNetInputSetDropTick(s32 player, u32 tick)
 			sSYNetInputMispredictTick = tick;
 			sSYNetInputIsMispredicted = TRUE;
 		}
+	}
+}
+
+void syNetInputSetFreezeTick(s32 player, u32 tick)
+{
+	if (syNetInputCheckPlayer(player) != FALSE)
+	{
+		sSYNetInputFreezeTick[player] = tick;
 	}
 }
 

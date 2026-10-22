@@ -95,6 +95,7 @@ extern u32 syNetInputGetRemoteNextUnconfirmed(s32 player);
 extern sb32 syNetInputTakeMispredictTick(u32 *out_tick);
 extern void syNetInputSetDropTick(s32 player, u32 tick);
 extern u32 syNetInputGetDropTick(s32 player);
+extern void syNetInputSetFreezeTick(s32 player, u32 tick);
 extern sb32 syNetInputGetRemoteConfirmedFrame(s32 player, u32 tick, SYNetInputFrame *out_frame);
 extern void syNetInputSetLocalDelay(u32 delay);
 extern u32 syNetInputGetLocalDelay(void);

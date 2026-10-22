@@ -385,6 +385,13 @@ void syNetRollbackStartVSSession(void)
 	sSYNetRollbackMaxArenaBytes = 0;
 }
 
+/* Sudden death restarts the session in the middle of a match: the tick counter goes on, so the
+ * confirmed trace must continue at the current tick instead of starting over at 0. */
+void syNetRollbackContinueTraceAt(u32 tick)
+{
+	sSYNetRollbackTraceNextTick = tick;
+}
+
 void syNetRollbackFinishVSSession(void)
 {
 #ifdef PORT
@@ -1138,6 +1145,10 @@ static void syNetRollbackRunNetplayUpdate(void (*update)(void))
 				port_log("SSB64 Rollback: netplay rollback FAILED tick=%u mispredict=%u chain_start=%u\n",
 				         tick, mispredict_tick, sSYNetRollbackChainStart);
 #endif
+				if (syNetPeerHasDrops() != FALSE)
+				{
+					syNetPeerAbortMatch("Lost sync with the other players");
+				}
 			}
 		}
 		syNetInputRepublishTick(tick);

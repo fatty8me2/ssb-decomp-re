@@ -21,6 +21,9 @@ extern void syNetPeerApplyDrops(u32 tick);
 extern void syNetPeerNotePlayerLeft(s32 transport);
 extern sb32 syNetPeerGetDropNotice(u32 *out_pending_mask, u32 *out_gone_mask, u32 *out_age_ms);
 extern sb32 syNetPeerIsSelfDropped(void);
+extern void syNetPeerAbortMatch(const char *why);
+extern const char *syNetPeerGetAbortReason(void);
+extern sb32 syNetPeerHasDrops(void);
 extern void syNetPeerStartOnline(s32 local_player, s32 player_count, const s32 *transports, u32 delay, sb32 is_host, const SYNetInputReplayMetadata *metadata);
 extern void syNetPeerMakeOnlineMetadata(SYNetInputReplayMetadata *metadata, s32 player_count, u32 stage, u32 stocks, sb32 is_items, u32 seed, const u8 *fighter_kinds, const u8 *costumes);
 

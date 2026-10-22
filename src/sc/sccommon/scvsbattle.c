@@ -561,6 +561,7 @@ void scVSBattleStartSuddenDeath(void)
 	SYColorRGBA color;
 
 	syNetRollbackStartVSSession();
+	syNetRollbackContinueTraceAt(syNetInputGetTick());     // the tick counter goes on into sudden death
 
 	gSCManagerSceneData.is_reset = FALSE;
 

@@ -71,6 +71,7 @@ void syNetPeerUpdateStartBarrier(void);
 void syNetPeerSendLocalInput(void);
 #ifdef PORT
 static void syNetPeerResetDrops(void);
+void syNetPeerAbortMatch(const char *why);
 static void syNetPeerUpdateDrops(void);
 #endif
 
@@ -92,7 +93,9 @@ static void syNetPeerUpdateDrops(void);
 #define SYNETPEER_DROP_FRAMES 8             // input frames per FORWARD packet
 #define SYNETPEER_DROP_NO_TICK 0xFFFFFFFFU
 #define SYNETPEER_DROP_PACKET_BYTES (4 + 2 + 2 + 4 + 4 + 4 + 4 + (SYNETPEER_DROP_FRAMES * 8) + 4)
-#define SYNETPEER_DROP_NOTIFY_RESENDS 8     // DECIDE copies sent to the dropped player itself (best effort)
+#define SYNETPEER_DROP_NOTIFY_EVERY 5       // every Nth resend also tells the dropped player itself (best effort, never stops)
+#define SYNETPEER_DROP_MAX_AHEAD 600        // a drop tick further ahead of our own tick than this is not believed
+#define SYNETPEER_DROP_REWIND_MAX 7         // the snapshot ring (8 slots) reaches this far back from our newest tick
 #define SYNETPEER_DROP_RESUME_GAP_MS 1500   // our own loop stalled this long: forgive everybody's silence
 
 #define SYNETPEER_DROP_STATE_NONE 0
@@ -149,7 +152,7 @@ typedef struct SYNetPeerDrop
 	u32 reports[MAXCONTROLLERS];
 	u32 known[MAXCONTROLLERS];           // the drop tick a survivor already knew, or none
 	sb32 acked[MAXCONTROLLERS];          // per survivor: it knows the agreed tick
-	s32 notify_left;                     // copies of DECIDE still to send to the subject itself
+	u32 first_want_ms;                   // test knob: when we first wanted to suspect it
 
 } SYNetPeerDrop;
 
@@ -204,6 +207,7 @@ u32 sSYNetPeerDropLastPollMs;
 u32 sSYNetPeerDropResumeMs;          // forgive silence before this time (our own loop was stalled)
 u32 sSYNetPeerDropEventMs;           // newest drop-out state change, for the on-screen notice
 sb32 sSYNetPeerSelfDropped;          // the others agreed that we are the one who dropped
+const char *sSYNetPeerAbortReason;   // the match is being ended because it can no longer stay in sync
 
 #ifdef PORT
 const char *sSYNetPeerBindSpec;
@@ -1404,9 +1408,28 @@ static sb32 syNetPeerIsSurvivor(s32 slot, s32 subject)
 	        (sSYNetPeerDrops[slot].state == SYNETPEER_DROP_STATE_NONE)) ? TRUE : FALSE;
 }
 
+/* Who decides the drop tick of `subject`: the lowest match slot that is not itself
+ * being dropped (suspected or decided). Every peer computes it from its own view,
+ * so DECIDE is only believed from this slot or a lower one (a peer that still
+ * counts someone as alive that we already suspect). */
+static s32 syNetPeerGetCoordinator(s32 subject)
+{
+	s32 slot;
+
+	for (slot = 0; slot < MAXCONTROLLERS; slot++)
+	{
+		if (syNetPeerIsSurvivor(slot, subject) != FALSE)
+		{
+			return slot;
+		}
+	}
+	return -1;
+}
+
 static void syNetPeerResetDrops(void)
 {
 	memset(sSYNetPeerDrops, 0, sizeof(sSYNetPeerDrops));
+	sSYNetPeerAbortReason = NULL;
 	sSYNetPeerDropArmed = FALSE;
 	sSYNetPeerDropLastPollMs = 0;
 	sSYNetPeerDropResumeMs = 0;
@@ -1480,9 +1503,42 @@ static void syNetPeerSuspect(s32 subject, const char *why)
 	{
 		return;
 	}
+	{
+		/* SSB64_NETPLAY_TEST_SUSPECT_DELAY=<slot>:<ms>, test only: this peer notices (and
+		 * believes) a drop that late, to exercise survivors with different views. */
+		static s32 delay_slot = -2;
+		static u32 delay_ms = 0;
+		u32 now = port_udp_now_ms();
+
+		if (delay_slot == -2)
+		{
+			const char *env = getenv("SSB64_NETPLAY_TEST_SUSPECT_DELAY");
+
+			delay_slot = -1;
+			if ((env != NULL) && (strchr(env, ':') != NULL))
+			{
+				delay_slot = atoi(env);
+				delay_ms = (u32)atoi(strchr(env, ':') + 1);
+			}
+		}
+		if ((delay_slot == sSYNetPeerLocalPlayer) && (delay_ms != 0))
+		{
+			if (drop->first_want_ms == 0)
+			{
+				drop->first_want_ms = now;
+			}
+			if ((now - drop->first_want_ms) < delay_ms)
+			{
+				return;
+			}
+		}
+	}
 	memset(drop, 0, sizeof(*drop));
 	drop->state = SYNETPEER_DROP_STATE_SUSPECT;
 	drop->report = syNetInputGetRemoteNextUnconfirmed(subject);
+	/* From here on input of the subject at or beyond what we hold is ignored until the drop tick is
+	 * agreed, so the contiguous input (and with it how far we may simulate) cannot grow past the report. */
+	syNetInputSetFreezeTick(subject, drop->report);
 	drop->have_report[sSYNetPeerLocalPlayer] = TRUE;
 	drop->reports[sSYNetPeerLocalPlayer] = drop->report;
 	drop->known[sSYNetPeerLocalPlayer] = SYNETPEER_DROP_NO_TICK;
@@ -1503,7 +1559,8 @@ static void syNetPeerDecide(s32 subject, u32 tick, const char *why)
 	{
 		if (drop->tick != tick)
 		{
-			port_log("SSB64 Drop: CONFLICT for player %d: keeping tick %u, ignoring %u (%s)\n", subject, drop->tick, tick, why);
+			port_log("SSB64 Drop: CONFLICT for player %d: have tick %u, got %u (%s)\n", subject, drop->tick, tick, why);
+			syNetPeerAbortMatch("The players disagreed about who left the match");
 		}
 		return;
 	}
@@ -1513,7 +1570,6 @@ static void syNetPeerDecide(s32 subject, u32 tick, const char *why)
 	}
 	drop->state = SYNETPEER_DROP_STATE_DECIDED;
 	drop->tick = tick;
-	drop->notify_left = SYNETPEER_DROP_NOTIFY_RESENDS;
 	memset(drop->acked, 0, sizeof(drop->acked));
 	drop->acked[sSYNetPeerLocalPlayer] = TRUE;
 	sSYNetPeerDropEventMs = port_udp_now_ms();
@@ -1522,11 +1578,15 @@ static void syNetPeerDecide(s32 subject, u32 tick, const char *why)
 	{
 		remote->dropped = TRUE;
 	}
+	syNetInputSetFreezeTick(subject, 0xFFFFFFFFU);
 	syNetInputSetDropTick(subject, tick);
 
 	port_log("SSB64 Drop: player %d leaves the match at tick=%u (%s) now=%u have_input_to=%u\n",
 	         subject, tick, why, syNetInputGetTick(), syNetInputGetRemoteNextUnconfirmed(subject));
-	syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_DECIDE, subject, tick, 0, NULL, 0);
+	if (syNetPeerGetCoordinator(subject) == sSYNetPeerLocalPlayer)
+	{
+		syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_DECIDE, subject, tick, 0, NULL, 0);
+	}
 }
 
 static void syNetPeerDropHandleReport(SYNetPeerRemote *remote, s32 subject, u32 a, u32 b)
@@ -1539,21 +1599,20 @@ static void syNetPeerDropHandleReport(SYNetPeerRemote *remote, s32 subject, u32 
 	}
 	if (drop->state == SYNETPEER_DROP_STATE_DECIDED)
 	{
-		/* It has not heard the decision yet. */
-		syNetPeerSendDrop(remote->player, SYNETPEER_DROP_KIND_DECIDE, subject, drop->tick, 0, NULL, 0);
+		/* It may become the coordinator: tell it the tick we know (only the coordinator decides). */
+		syNetPeerSendDrop(remote->player, SYNETPEER_DROP_KIND_REPORT, subject, drop->report, drop->tick, NULL, 0);
 		return;
 	}
 	if (drop->state == SYNETPEER_DROP_STATE_NONE)
 	{
 		syNetPeerSuspect(subject, "reported by another player");
 	}
-	drop->have_report[remote->player] = TRUE;
-	drop->reports[remote->player] = a;
-	drop->known[remote->player] = b;
-
-	if (b != SYNETPEER_DROP_NO_TICK)
+	if (drop->state == SYNETPEER_DROP_STATE_SUSPECT)
 	{
-		syNetPeerDecide(subject, b, "known to a survivor");
+		/* Recorded only; the coordinator is the one who turns reports into a decision. */
+		drop->have_report[remote->player] = TRUE;
+		drop->reports[remote->player] = a;
+		drop->known[remote->player] = b;
 	}
 }
 
@@ -1561,6 +1620,38 @@ static void syNetPeerDropHandleDecide(SYNetPeerRemote *remote, s32 subject, u32 
 {
 	SYNetPeerDrop *drop = &sSYNetPeerDrops[subject];
 
+	u32 now_tick = syNetInputGetTick();
+	s32 coordinator = syNetPeerGetCoordinator(subject);
+
+	/* Only the coordinator decides. A peer we count as dead may be the real coordinator (it is lower),
+	 * but a higher slot than ours is not. */
+	if ((coordinator >= 0) && (remote->player > coordinator))
+	{
+		port_log("SSB64 Drop: ignored DECIDE(player %d, tick %u) from player %d: not the coordinator (%d)\n",
+		         subject, tick, remote->player, coordinator);
+		return;
+	}
+	if (drop->state == SYNETPEER_DROP_STATE_DECIDED)
+	{
+		if (drop->tick == tick)
+		{
+			drop->acked[remote->player] = TRUE;
+			syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_ACK, subject, tick, 0, NULL, 0);
+		}
+		else syNetPeerDecide(subject, tick, "decided by a survivor");
+		return;
+	}
+	/* A tick the snapshot ring can't rewind to, one that is far ahead of us, or one below what we hold: the
+	 * players no longer share a picture of the match. End it cleanly instead of desyncing. */
+	if ((subject != sSYNetPeerLocalPlayer) &&
+	    ((((tick + SYNETPEER_DROP_REWIND_MAX) < now_tick) || (tick > (now_tick + SYNETPEER_DROP_MAX_AHEAD))) ||
+	     ((drop->state == SYNETPEER_DROP_STATE_SUSPECT) && (tick < drop->report))))
+	{
+		port_log("SSB64 Drop: DECIDE(player %d, tick %u) from player %d is not usable at tick %u (held input up to %u)\n",
+		         subject, tick, remote->player, now_tick, drop->report);
+		syNetPeerAbortMatch("Lost sync with the other players");
+		return;
+	}
 	if (subject == sSYNetPeerLocalPlayer)
 	{
 		if (sSYNetPeerSelfDropped == FALSE)
@@ -1568,15 +1659,16 @@ static void syNetPeerDropHandleDecide(SYNetPeerRemote *remote, s32 subject, u32 
 			sSYNetPeerSelfDropped = TRUE;
 			sSYNetPeerDropEventMs = port_udp_now_ms();
 			port_log("SSB64 Drop: the other players dropped us from the match at tick=%u\n", tick);
+			syNetPeerAbortMatch("You were disconnected from the match");
 		}
 		return;
 	}
-	syNetPeerDecide(subject, tick, "decided by a survivor");
+	syNetPeerDecide(subject, tick, "decided by the coordinator");
 
 	if ((drop->state == SYNETPEER_DROP_STATE_DECIDED) && (drop->tick == tick))
 	{
 		drop->acked[remote->player] = TRUE;
-		syNetPeerSendDrop(remote->player, SYNETPEER_DROP_KIND_ACK, subject, tick, 0, NULL, 0);
+		syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_ACK, subject, tick, 0, NULL, 0);
 	}
 }
 
@@ -1588,7 +1680,12 @@ static void syNetPeerDropHandleRequest(SYNetPeerRemote *remote, s32 subject, u32
 	s32 count = 0;
 	u32 tick;
 
-	for (tick = from; (tick < to) && (count < SYNETPEER_DROP_FRAMES); tick++)
+	/* Only for a drop we agreed to, and only up to its tick: a request for anything else is bogus. */
+	if ((sSYNetPeerDrops[subject].state != SYNETPEER_DROP_STATE_DECIDED) || (to != sSYNetPeerDrops[subject].tick) || (from >= to))
+	{
+		return;
+	}
+	for (tick = from; (tick < to) && (tick < (from + SYNETINPUT_HISTORY_LENGTH)) && (count < SYNETPEER_DROP_FRAMES); tick++)
 	{
 		if (syNetInputGetRemoteConfirmedFrame(subject, tick, &frame) != FALSE)
 		{
@@ -1702,34 +1799,31 @@ static void syNetPeerDropCoordinate(s32 subject)
 	u32 known = SYNETPEER_DROP_NO_TICK;
 	s32 slot;
 
+	if (syNetPeerGetCoordinator(subject) != sSYNetPeerLocalPlayer)
+	{
+		return;     // not the coordinator: it decides
+	}
 	for (slot = 0; slot < MAXCONTROLLERS; slot++)
 	{
 		if (syNetPeerIsSurvivor(slot, subject) != FALSE)
 		{
-			break;
+			if (drop->have_report[slot] == FALSE)
+			{
+				return;     // a survivor we have not heard from yet
+			}
 		}
-	}
-	if (slot != sSYNetPeerLocalPlayer)
-	{
-		return;     // not the lowest survivor: it decides
-	}
-	for (slot = 0; slot < MAXCONTROLLERS; slot++)
-	{
-		if (syNetPeerIsSurvivor(slot, subject) == FALSE)
+		if (drop->have_report[slot] != FALSE)
 		{
-			continue;
-		}
-		if (drop->have_report[slot] == FALSE)
-		{
-			return;
-		}
-		if (drop->reports[slot] > tick)
-		{
-			tick = drop->reports[slot];
-		}
-		if (drop->known[slot] != SYNETPEER_DROP_NO_TICK)
-		{
-			known = drop->known[slot];
+			/* Every report counts, also from a peer we already doubt: the drop tick must not be lower
+			 * than what anyone of them holds, or somebody would have to rewind past the snapshot ring. */
+			if (drop->reports[slot] > tick)
+			{
+				tick = drop->reports[slot];
+			}
+			if (drop->known[slot] != SYNETPEER_DROP_NO_TICK)
+			{
+				known = drop->known[slot];
+			}
 		}
 	}
 	syNetPeerDecide(subject, (known != SYNETPEER_DROP_NO_TICK) ? known : tick, "coordinator");
@@ -1780,6 +1874,37 @@ static void syNetPeerUpdateDrops(void)
 			syNetPeerSuspect(remote->player, "silent");
 		}
 	}
+	{
+		/* SSB64_NETPLAY_TEST_FORGE=<slot>, test only: that peer sends bogus drop messages once (a DECIDE for tick 0,
+		 * a REQUEST for ~4 billion ticks, a REPORT claiming a decided tick) about the highest other slot. The
+		 * receivers must shrug them off. */
+		static s32 forge_slot = -2;
+		static sb32 forged = FALSE;
+
+		if (forge_slot == -2)
+		{
+			const char *env = getenv("SSB64_NETPLAY_TEST_FORGE");
+
+			forge_slot = (env != NULL) ? atoi(env) : -1;
+		}
+		if ((forge_slot == sSYNetPeerLocalPlayer) && (forged == FALSE) && (syNetInputGetTick() > 600))
+		{
+			s32 target = (sSYNetPeerLocalPlayer == 0) ? 2 : ((sSYNetPeerLocalPlayer == 3) ? 2 : 3);
+
+			forged = TRUE;
+			for (target = MAXCONTROLLERS - 1; target >= 0; target--)
+			{
+				if ((target != sSYNetPeerLocalPlayer) && (syNetPeerIsMatchSlot(target) != FALSE))
+				{
+					break;
+				}
+			}
+			port_log("SSB64 Drop: TEST forging drop messages about player %d\n", target);
+			syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_DECIDE, target, 0, 0, NULL, 0);
+			syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_REQUEST, target, 0, 0xFFFFFFF0U, NULL, 0);
+			syNetPeerSendDrop(-1, SYNETPEER_DROP_KIND_FORWARD, target, 0, 0, NULL, 0);
+		}
+	}
 	resend = ((sSYNetPeerSendPhase % SYNETPEER_DROP_RESEND_FRAMES) == 0) ? TRUE : FALSE;
 	request = ((sSYNetPeerSendPhase % SYNETPEER_DROP_REQUEST_FRAMES) == 0) ? TRUE : FALSE;
 
@@ -1803,18 +1928,25 @@ static void syNetPeerUpdateDrops(void)
 
 			if (resend != FALSE)
 			{
+				sb32 is_coordinator = (syNetPeerGetCoordinator(subject) == sSYNetPeerLocalPlayer) ? TRUE : FALSE;
+
 				for (slot = 0; slot < MAXCONTROLLERS; slot++)
 				{
 					if ((syNetPeerIsSurvivor(slot, subject) != FALSE) && (slot != sSYNetPeerLocalPlayer) &&
 					    (drop->acked[slot] == FALSE))
 					{
-						syNetPeerSendDrop(slot, SYNETPEER_DROP_KIND_DECIDE, subject, drop->tick, 0, NULL, 0);
+						/* The coordinator repeats the decision; anyone else only says which tick it knows, so a
+						 * survivor that becomes coordinator after the old one died reuses it. */
+						if (is_coordinator != FALSE)
+						{
+							syNetPeerSendDrop(slot, SYNETPEER_DROP_KIND_DECIDE, subject, drop->tick, 0, NULL, 0);
+						}
+						else syNetPeerSendDrop(slot, SYNETPEER_DROP_KIND_REPORT, subject, drop->report, drop->tick, NULL, 0);
 					}
 				}
-				if (drop->notify_left > 0)
+				if ((sSYNetPeerSendPhase % (SYNETPEER_DROP_RESEND_FRAMES * SYNETPEER_DROP_NOTIFY_EVERY)) == 0)
 				{
-					/* Best effort: lets a player that was only cut off from us know. */
-					drop->notify_left--;
+					/* Best effort: lets a player that was only cut off or frozen learn it was dropped. */
 					syNetPeerSendDrop(subject, SYNETPEER_DROP_KIND_DECIDE, subject, drop->tick, 0, NULL, 0);
 				}
 			}
@@ -1825,6 +1957,52 @@ static void syNetPeerUpdateDrops(void)
 			}
 		}
 	}
+}
+
+/* The players can no longer be kept in sync (disagreement about a drop, a rollback that cannot be
+ * served, being dropped ourselves): leave the match through the same exit as the menu's Reset and
+ * tell the lobby why, instead of playing on diverged. */
+void syNetPeerAbortMatch(const char *why)
+{
+#ifdef PORT
+	extern void portSCManagerRequestReset(void);
+	extern void port_netlobby_set_match_note(const char *note);
+
+	if ((sSYNetPeerAbortReason != NULL) || (sSYNetPeerIsActive == FALSE))
+	{
+		return;
+	}
+	sSYNetPeerAbortReason = why;
+	sSYNetPeerDropEventMs = port_udp_now_ms();
+	port_log("SSB64 Drop: ending the match: %s\n", why);
+	port_netlobby_set_match_note(why);
+	portSCManagerRequestReset();
+#endif
+}
+
+const char *syNetPeerGetAbortReason(void)
+{
+#ifdef PORT
+	return (sSYNetPeerIsActive != FALSE) ? sSYNetPeerAbortReason : NULL;
+#else
+	return NULL;
+#endif
+}
+
+sb32 syNetPeerHasDrops(void)
+{
+#ifdef PORT
+	s32 player;
+
+	for (player = 0; player < MAXCONTROLLERS; player++)
+	{
+		if (sSYNetPeerDrops[player].state != SYNETPEER_DROP_STATE_NONE)
+		{
+			return TRUE;
+		}
+	}
+#endif
+	return FALSE;
 }
 
 /* The knock-out: the fighter of a dropped player leaves exactly like a player
