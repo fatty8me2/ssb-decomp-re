@@ -140,6 +140,7 @@ typedef struct SYNetPeerRemote
 	u32 last_heard_ms;          // port_udp_now_ms() of the newest datagram from it
 	sb32 dropped;               // the survivors agreed it left the match: no more traffic with it
 	sb32 left_hint;             // the lobby reported it left the room
+	sb32 barrier_skip;          // a stand-in barrier master gave up waiting for it (the barrier only; the drop still goes through the agreement)
 
 } SYNetPeerRemote;
 
@@ -435,6 +436,7 @@ static void syNetPeerAddRemote(s32 player, s32 transport, sb32 is_host)
 	remote->transport = transport;
 	remote->is_host = is_host;
 	remote->left_hint = FALSE;
+	remote->barrier_skip = FALSE;
 	syNetPeerResetRemoteStats(remote);
 }
 
@@ -2537,7 +2539,7 @@ static s32 syNetPeerCountBattleReady(void)
 
 	for (i = 0; i < sSYNetPeerRemoteCount; i++)
 	{
-		count += ((sSYNetPeerRemotes[i].battle_ready != FALSE) || (sSYNetPeerRemotes[i].left_hint != FALSE)) ? 1 : 0;
+		count += ((sSYNetPeerRemotes[i].battle_ready != FALSE) || (sSYNetPeerRemotes[i].left_hint != FALSE) || (sSYNetPeerRemotes[i].barrier_skip != FALSE)) ? 1 : 0;
 	}
 	return count;
 }
@@ -2549,7 +2551,7 @@ static s32 syNetPeerCountBattleStart(void)
 
 	for (i = 0; i < sSYNetPeerRemoteCount; i++)
 	{
-		count += ((sSYNetPeerRemotes[i].battle_start != FALSE) || (sSYNetPeerRemotes[i].left_hint != FALSE)) ? 1 : 0;
+		count += ((sSYNetPeerRemotes[i].battle_start != FALSE) || (sSYNetPeerRemotes[i].left_hint != FALSE) || (sSYNetPeerRemotes[i].barrier_skip != FALSE)) ? 1 : 0;
 	}
 	return count;
 }
@@ -2586,7 +2588,9 @@ static sb32 syNetPeerIsBarrierMaster(void)
 	}
 	for (i = 0; i < sSYNetPeerRemoteCount; i++)
 	{
-		if ((sSYNetPeerRemotes[i].left_hint == FALSE) && (sSYNetPeerRemotes[i].player < sSYNetPeerLocalPlayer))
+		/* Only players that reached the battle can run its barrier: one that is still in the lobby never will. */
+		if ((sSYNetPeerRemotes[i].left_hint == FALSE) && (sSYNetPeerRemotes[i].battle_ready != FALSE) &&
+		    (sSYNetPeerRemotes[i].player < sSYNetPeerLocalPlayer))
 		{
 			return FALSE;
 		}
@@ -2674,9 +2678,9 @@ void syNetPeerUpdateStartBarrier(void)
 			{
 				SYNetPeerRemote *remote = &sSYNetPeerRemotes[i];
 
-				if ((remote->battle_ready == FALSE) && (remote->left_hint == FALSE))
+				if ((remote->battle_ready == FALSE) && (remote->left_hint == FALSE) && (remote->barrier_skip == FALSE))
 				{
-					remote->left_hint = TRUE;
+					remote->barrier_skip = TRUE;
 					port_log("SSB64 NetPeer: player %d never reached the battle, starting without it\n", remote->player);
 				}
 			}
