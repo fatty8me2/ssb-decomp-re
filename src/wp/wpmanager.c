@@ -4,6 +4,7 @@
 #include <ft/fighter.h>
 
 #ifdef PORT
+#include <string.h>
 #include <config.h>
 extern void portFixupStructU16(void *base, unsigned int byte_offset, unsigned int num_words);
 extern void port_log(const char *fmt, ...);
@@ -66,6 +67,9 @@ WPStruct* wpManagerGetNextStructAlloc(void)
     get_weapon = new_weapon;
 
     sWPManagerStructsAllocFree = new_weapon->next;
+#ifdef PORT
+    memset(get_weapon, 0, sizeof(*get_weapon));    /* see itManagerGetNextStructAlloc: no stale pool bytes */
+#endif
 
     return get_weapon;
 }

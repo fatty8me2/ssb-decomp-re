@@ -105,6 +105,7 @@ typedef struct SYNetPeerRemote
 	sb32 battle_ready;          // in-battle barrier: it reached the battle
 	sb32 battle_start;          // in-battle barrier: it released
 	u32 packets_received;
+	u32 last_heard_ms;          // port_udp_now_ms() of the newest datagram from it
 
 } SYNetPeerRemote;
 
@@ -360,6 +361,9 @@ static void syNetPeerResetRemoteStats(SYNetPeerRemote *remote)
 	remote->battle_ready = FALSE;
 	remote->battle_start = FALSE;
 	remote->packets_received = 0;
+#ifdef PORT
+	remote->last_heard_ms = port_udp_now_ms();
+#endif
 }
 
 static void syNetPeerAddRemote(s32 player, s32 transport, sb32 is_host)
@@ -413,6 +417,41 @@ u32 syNetPeerGetConfirmedTick(void)
 s32 syNetPeerGetRemoteCount(void)
 {
 	return sSYNetPeerRemoteCount;
+}
+
+/* The remote that has been silent longest, if it has been silent for more than
+ * `threshold_ms` during an active online match: its game slot, else -1. Every
+ * other peer stalls behind a missing player, so the UI says who it is waiting
+ * for. */
+s32 syNetPeerGetSilentPlayer(u32 threshold_ms, u32 *out_silent_ms)
+{
+#ifdef PORT
+	s32 worst = -1;
+	u32 worst_ms = 0;
+	s32 i;
+
+	if ((sSYNetPeerIsActive == FALSE) || (sSYNetPeerIsSocketExternal == FALSE))
+	{
+		return -1;
+	}
+	for (i = 0; i < sSYNetPeerRemoteCount; i++)
+	{
+		u32 silent = port_udp_now_ms() - sSYNetPeerRemotes[i].last_heard_ms;
+
+		if ((silent > threshold_ms) && (silent > worst_ms))
+		{
+			worst = sSYNetPeerRemotes[i].player;
+			worst_ms = silent;
+		}
+	}
+	if ((worst >= 0) && (out_silent_ms != NULL))
+	{
+		*out_silent_ms = worst_ms;
+	}
+	return worst;
+#else
+	return -1;
+#endif
 }
 
 #ifdef PORT
@@ -1004,6 +1043,12 @@ void syNetPeerStartVSSession(void)
 		memset(&gITManagerRandomWeights, 0, sizeof(gITManagerRandomWeights));
 		memset(&gITManagerMonsterData, 0, sizeof(gITManagerMonsterData));
 		memset(&gITManagerAppearActor, 0, sizeof(gITManagerAppearActor));
+
+		/* Hit-refresh counters: ftManagerInitAll sets them to 1, but stage items (the Castle bumper)
+		 * are created before it and record the current value in their attack data. Whatever the
+		 * previous scenes on this PC left there would differ from the other players. */
+		gFTManagerMotionCount = 0;
+		gFTManagerStatUpdateCount = 0;
 	}
 
 	port_log("SSB64 NetPeer: VS session start role=%s local=%d remotes=%d delay=%u barrier=%d rollback=%d fuzz=%u tick=%u\n",
@@ -1407,6 +1452,7 @@ void syNetPeerReceiveRemoteInput(void)
 			sSYNetPeerPacketsDropped++;     // a lobby member that isn't in this match
 			continue;
 		}
+		remote->last_heard_ms = port_udp_now_ms();
 		syNetPeerHandlePacket(remote, buffer, (s32)size);
 	}
 #endif
@@ -1895,6 +1941,19 @@ void syNetPeerMakeOnlineMetadata(SYNetInputReplayMetadata *metadata, s32 player_
 	metadata->player_count = player_count;
 	metadata->stage_kind = stage;
 	metadata->stocks = (stocks > 0) ? stocks - 1 : 0;   // the engine stores lives - 1 (3 = "4 Stocks")
+#ifdef PORT
+	{
+		/* SSB64_NETPLAY_TEST_MINUTES=<n>: test-only, a timed match that ends by itself
+		 * (exercises the time-up sequence and rematches). Every peer must set it. */
+		const char *test_minutes = getenv("SSB64_NETPLAY_TEST_MINUTES");
+
+		if ((test_minutes != NULL) && (atoi(test_minutes) > 0))
+		{
+			metadata->game_rules = SCBATTLE_GAMERULE_TIME;
+			metadata->time_limit = atoi(test_minutes);
+		}
+	}
+#endif
 	metadata->rng_seed = seed;
 
 	if (is_items != FALSE)

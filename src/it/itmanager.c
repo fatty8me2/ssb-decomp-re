@@ -8,6 +8,7 @@
 #include <reloc_data.h>
 
 #ifdef PORT
+#include <string.h>
 #include <config.h>
 #include <sys/debug.h>
 extern void *func_800269C0_275C0(u16 id);
@@ -183,6 +184,12 @@ ITStruct* itManagerGetNextStructAlloc(void) // Set global Item user_data link po
     get_item = new_item;
 
     gITManagerStructsAllocFree = new_item->next;
+#ifdef PORT
+    /* The creation code sets only some fields (the ledge-catch box, last frame's masks, line ids, attack
+     * data of non-attacking items...); the rest kept whatever the pool slot held, which differs from PC to
+     * PC, and the state hash and rollback snapshots read all of it. Start every item from zero. */
+    memset(get_item, 0, sizeof(*get_item));
+#endif
 
     return get_item;
 }

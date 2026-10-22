@@ -12,6 +12,7 @@ extern sb32 syNetPeerCheckBattleExecutionReady(void);
 extern sb32 syNetPeerIsRollbackActive(void);
 extern u32 syNetPeerGetConfirmedTick(void);
 extern s32 syNetPeerGetRemoteCount(void);
+extern s32 syNetPeerGetSilentPlayer(u32 threshold_ms, u32 *out_silent_ms);
 extern sb32 syNetPeerCheckStartBarrierReleased(void);
 extern void syNetPeerUpdateBattleGate(void);
 extern void syNetPeerUpdate(void);
