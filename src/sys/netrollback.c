@@ -208,7 +208,8 @@ static s32 syNetRollbackGetEnvInt(const char *name, s32 fallback)
 /* SSB64_ROLLBACK_AUTOVS=1: skip the menus into a 4-CPU (level 9) VS match so
  * SyncTest runs unattended. Optional: SSB64_ROLLBACK_STAGE (gkind),
  * SSB64_ROLLBACK_FIGHTERS ("fkind,fkind,fkind,fkind"), SSB64_ROLLBACK_SEED,
- * SSB64_ROLLBACK_MINUTES (default 1). */
+ * SSB64_ROLLBACK_MINUTES (default 1),
+ * SSB64_ROLLBACK_PLAYERS (active CPU count 2-4, default 4). */
 static void syNetRollbackSetupAutoVS(void)
 {
 	SCBattleState battle_state = dSCManagerDefaultBattleState;
@@ -241,7 +242,7 @@ static void syNetRollbackSetupAutoVS(void)
 			}
 			fighters_env = (*fighters_env == ',') ? fighters_env + 1 : NULL;
 		}
-		metadata.player_kinds[player] = nFTPlayerKindCom;
+		metadata.player_kinds[player] = (player < syNetRollbackGetEnvInt("SSB64_ROLLBACK_PLAYERS", MAXCONTROLLERS)) ? nFTPlayerKindCom : nFTPlayerKindNot;
 		metadata.fighter_kinds[player] = fkind;
 		metadata.costumes[player] = 0;
 		metadata.teams[player] = player;
