@@ -42,7 +42,8 @@ extern void port_log(const char *fmt, ...);
 #define SYNETPEER_BOOTSTRAP_RETRY_USECS 16666
 #define SYNETPEER_BARRIER_LOG_INTERVAL 30
 #define SYNETPEER_BATTLE_START_REPEAT_FRAMES 60
-#define SYNETPEER_STANDIN_GIVEUP_FRAMES 900     // a stand-in barrier master (host migration) waits this long for a player's READY
+#define SYNETPEER_STANDIN_GIVEUP_FRAMES 900     // a stand-in barrier master (host migration) starts skipping players the others agreed dropped
+#define SYNETPEER_STANDIN_ABORT_FRAMES 18000    // ...and gives up on the whole barrier after this long (5 min at 60 fps)
 
 /* Barrier chatter: READY goes out every 4th frame and the host's START every
  * other frame (every frame would cost the relay 60 messages a second per
@@ -2670,19 +2671,25 @@ void syNetPeerUpdateStartBarrier(void)
 	{
 		if ((sSYNetPeerBootstrapIsHost == FALSE) && (sSYNetPeerBattleBarrierWaitFrames > SYNETPEER_STANDIN_GIVEUP_FRAMES))
 		{
-			/* We stand in for a host that left before the barrier: a player that never reached the battle
-			 * (it missed the host's BEGIN and waits in the lobby) must not hold everybody else here forever. */
+			/* We stand in for a host that left before the barrier. Only a player confirmed gone (the survivors
+			 * agreed it dropped) may be skipped; a merely slow one keeps being waited for. */
 			s32 i;
 
 			for (i = 0; i < sSYNetPeerRemoteCount; i++)
 			{
 				SYNetPeerRemote *remote = &sSYNetPeerRemotes[i];
 
-				if ((remote->battle_ready == FALSE) && (remote->left_hint == FALSE) && (remote->barrier_skip == FALSE))
+				if ((remote->battle_ready == FALSE) && (remote->left_hint == FALSE) && (remote->barrier_skip == FALSE) &&
+				    (remote->dropped != FALSE))
 				{
 					remote->barrier_skip = TRUE;
-					port_log("SSB64 NetPeer: player %d never reached the battle, starting without it\n", remote->player);
+					port_log("SSB64 NetPeer: player %d was dropped before the battle, starting without it\n", remote->player);
 				}
+			}
+			if (sSYNetPeerBattleBarrierWaitFrames > SYNETPEER_STANDIN_ABORT_FRAMES)
+			{
+				syNetPeerAbortMatch("Gave up waiting for the other players to get ready");
+				return;
 			}
 		}
 		if (syNetPeerCountBattleReady() == sSYNetPeerRemoteCount)
