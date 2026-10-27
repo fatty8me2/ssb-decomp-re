@@ -2955,6 +2955,27 @@ void syNetPeerStopVSSession(void)
 		/* Online match over: keep the lobby's socket (rematch), and drop back
 		 * to offline so the next local VS match isn't netplay. */
 		extern void port_netlobby_on_match_end(void);
+		extern void port_netlobby_report_result(s32 count, const u8 *fkind, const u8 *place, const s8 *stocks, const s32 *kos, const s32 *falls);
+		u8 res_fkind[MAXCONTROLLERS], res_place[MAXCONTROLLERS];
+		s8 res_stocks[MAXCONTROLLERS];
+		s32 res_kos[MAXCONTROLLERS], res_falls[MAXCONTROLLERS];
+		s32 res_i;
+
+		/* RetroHub rivalries: hand each player's result to the lobby, which writes SSB64_RESULT_FILE for the hub. */
+		if (gSCManagerBattleState != NULL)
+		{
+			for (res_i = 0; res_i < MAXCONTROLLERS; res_i++)
+			{
+				SCPlayerData *pd = &gSCManagerBattleState->players[res_i];
+
+				res_fkind[res_i] = (pd->pkind == nFTPlayerKindMan) ? pd->fkind : nFTKindNull;
+				res_place[res_i] = pd->place;
+				res_stocks[res_i] = pd->stock_count;
+				res_kos[res_i] = pd->score;
+				res_falls[res_i] = pd->falls;
+			}
+			port_netlobby_report_result(MAXCONTROLLERS, res_fkind, res_place, res_stocks, res_kos, res_falls);
+		}
 
 		sSYNetPeerIsEnabled = FALSE;
 		sSYNetPeerIsConfigured = FALSE;
